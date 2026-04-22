@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/zsiec/ccx"
@@ -61,28 +62,29 @@ type SCTE35Event struct {
 // and H.265 video with multiple AAC audio tracks. Parsed output is delivered
 // through channels obtained via the Video, Audio, and Captions methods.
 type Demuxer struct {
-	log         *slog.Logger
-	reader      io.Reader
-	videoCh     chan *media.VideoFrame
-	audioCh     chan *media.AudioFrame
-	captionCh   chan *ccx.CaptionFrame
-	cea608Decs  map[int]*ccx.CEA608Decoder
-	cea708Svcs  map[int]*ccx.CEA708Service
-	dtvccBuf    []byte
-	videoPID    uint16
-	audioPIDs   map[uint16]int
-	audioTracks []AudioTrackInfo
-	pmtReady    chan struct{}
-	pmtDone     bool
-	isHEVC      bool
-	sps         []byte
-	pps         []byte
-	vps         []byte
-	spsInfo     SPSInfo
-	hevcSPSInfo HEVCSPSInfo
-	groupID     uint32
-	videoCount  int64
-	stats       StatsRecorder
+	log          *slog.Logger
+	reader       io.Reader
+	videoCh      chan *media.VideoFrame
+	audioCh      chan *media.AudioFrame
+	captionCh    chan *ccx.CaptionFrame
+	cea608Decs   map[int]*ccx.CEA608Decoder
+	cea708Svcs   map[int]*ccx.CEA708Service
+	dtvccBuf     []byte
+	videoPID     uint16
+	audioPIDs    map[uint16]int
+	audioTracks  []AudioTrackInfo
+	teletextPIDs map[uint16]*teletextDecoder
+	pmtReady     chan struct{}
+	pmtDone      bool
+	isHEVC       bool
+	sps          []byte
+	pps          []byte
+	vps          []byte
+	spsInfo      SPSInfo
+	hevcSPSInfo  HEVCSPSInfo
+	groupID      uint32
+	videoCount   int64
+	stats        StatsRecorder
 
 	lastCCCtrl      [2][2]byte
 	lastCCWasCtrl   [2]bool
@@ -97,13 +99,14 @@ func NewDemuxer(r io.Reader, log *slog.Logger) *Demuxer {
 		log = slog.Default()
 	}
 	return &Demuxer{
-		log:       log.With("component", "demux"),
-		reader:    r,
-		videoCh:   make(chan *media.VideoFrame, media.VideoBufferSize),
-		audioCh:   make(chan *media.AudioFrame, media.AudioBufferSize),
-		captionCh: make(chan *ccx.CaptionFrame, media.CaptionBufferSize),
-		audioPIDs: make(map[uint16]int),
-		pmtReady:  make(chan struct{}),
+		log:          log.With("component", "demux"),
+		reader:       r,
+		videoCh:      make(chan *media.VideoFrame, media.VideoBufferSize),
+		audioCh:      make(chan *media.AudioFrame, media.AudioBufferSize),
+		captionCh:    make(chan *ccx.CaptionFrame, media.CaptionBufferSize),
+		audioPIDs:    make(map[uint16]int),
+		teletextPIDs: make(map[uint16]*teletextDecoder),
+		pmtReady:     make(chan struct{}),
 		cea708Svcs: map[int]*ccx.CEA708Service{
 			1: ccx.NewCEA708Service(),
 			2: ccx.NewCEA708Service(),
@@ -232,6 +235,13 @@ func (d *Demuxer) Run(ctx context.Context) error {
 						d.log.Info("found audio PID", "pid", es.ElementaryPID, "trackIndex", audioIdx)
 						audioIdx++
 					}
+				case streamTypePrivateData:
+					if td := newTeletextDecoderFromDescriptors(es.Descriptors); td != nil {
+						if _, exists := d.teletextPIDs[es.ElementaryPID]; !exists {
+							d.teletextPIDs[es.ElementaryPID] = td
+							d.log.Info("found teletext PID", "pid", es.ElementaryPID)
+						}
+					}
 				}
 			}
 			if !d.pmtDone {
@@ -258,6 +268,8 @@ func (d *Demuxer) Run(ctx context.Context) error {
 			d.handleVideo(ctx, data.PES)
 		} else if trackIdx, ok := d.audioPIDs[pid]; ok {
 			d.handleAudio(ctx, data.PES, trackIdx)
+		} else if td, ok := d.teletextPIDs[pid]; ok {
+			d.handleTeletext(ctx, data.PES, td)
 		}
 	}
 }
@@ -528,6 +540,47 @@ func (d *Demuxer) drainDTVCC(ctx context.Context, pts int64) {
 		}
 	}
 	d.dtvccBuf = d.dtvccBuf[packetSize:]
+}
+
+func (d *Demuxer) handleTeletext(ctx context.Context, pes *mpegts.PESData, td *teletextDecoder) {
+	if len(pes.Data) == 0 {
+		return
+	}
+
+	var pts int64
+	if pes.Header != nil && pes.Header.OptionalHeader != nil {
+		if pes.Header.OptionalHeader.PTS != nil {
+			pts = pes.Header.OptionalHeader.PTS.Base * 1000000 / 90000
+		}
+	}
+
+	for _, out := range td.processTeletextPES(pes.Data, pts) {
+		if len(out.lines) == 0 {
+			continue
+		}
+		text := strings.Join(out.lines, "\n")
+		frame := &ccx.CaptionFrame{
+			PTS:     out.pts,
+			Text:    text,
+			Channel: teletextChannel,
+		}
+		var rows []ccx.CaptionRow
+		for i, line := range out.lines {
+			rows = append(rows, ccx.CaptionRow{
+				Row:   i,
+				Spans: []ccx.CaptionSpan{{Text: line}},
+			})
+		}
+		frame.Regions = []ccx.CaptionRegion{{Rows: rows}}
+		if d.stats != nil {
+			d.stats.RecordCaption(teletextChannel)
+		}
+		select {
+		case d.captionCh <- frame:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (d *Demuxer) handleSCTE35(section []byte) {

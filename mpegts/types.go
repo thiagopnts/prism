@@ -45,10 +45,17 @@ type PMTData struct {
 	ElementaryStreams []*PMTElementaryStream
 }
 
+// PMTDescriptor is a raw descriptor from a PMT elementary stream entry.
+type PMTDescriptor struct {
+	Tag  uint8
+	Data []byte
+}
+
 // PMTElementaryStream describes a single elementary stream in a PMT.
 type PMTElementaryStream struct {
 	ElementaryPID uint16
 	StreamType    uint8
+	Descriptors   []PMTDescriptor
 }
 
 // PESData contains a reassembled Packetized Elementary Stream.
