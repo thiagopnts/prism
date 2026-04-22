@@ -374,6 +374,11 @@ func (d *Demuxer) handleVideoHEVC(ctx context.Context, data []byte, pts, dts int
 			isKeyframe = true
 		case nalu.Type == HEVCNALSEIPrefix:
 			if len(nalu.Data) > 2 {
+				if tc, ok := ParseHEVCTimeCodeSEI(nalu.Data); ok {
+					if d.stats != nil {
+						d.stats.RecordTimecode(tc.String())
+					}
+				}
 				d.handleCaptionSEI(ctx, nalu.Data, pts)
 			}
 		}

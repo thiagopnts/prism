@@ -314,3 +314,127 @@ func parseHEVCProfileTierLevel(br *bitReader, info *HEVCSPSInfo, maxSubLayersMin
 
 	return nil
 }
+
+const SEI_PAYLOAD_TYPE_TIME_CODE = 136
+
+// ParseHEVCTimeCodeSEI extracts a SMPTE 12M timecode from an HEVC time_code
+// SEI message (payload type 136). Unlike H.264 pic_timing, the HEVC time_code
+// SEI is self-contained and does not require SPS HRD parameters.
+func ParseHEVCTimeCodeSEI(seiNALU []byte) (Timecode, bool) {
+	if len(seiNALU) < 3 {
+		return Timecode{}, false
+	}
+
+	// HEVC NAL header is 2 bytes; skip them before SEI payload parsing.
+	rbsp := removeEmulationPrevention(seiNALU[2:])
+	payload := findSEIPayload(rbsp, SEI_PAYLOAD_TYPE_TIME_CODE)
+	if payload == nil {
+		return Timecode{}, false
+	}
+	return parseHEVCTimeCodePayload(payload)
+}
+
+func parseHEVCTimeCodePayload(payload []byte) (Timecode, bool) {
+	br := newBitReader(payload)
+
+	numClockTS, err := br.readBits(2)
+	if err != nil || numClockTS == 0 {
+		return Timecode{}, false
+	}
+
+	for c := 0; c < int(numClockTS); c++ {
+		clockTSFlag, err := br.readBits(1)
+		if err != nil {
+			return Timecode{}, false
+		}
+		if clockTSFlag == 0 {
+			continue
+		}
+
+		br.readBits(1) // units_field_based_flag
+		br.readBits(5) // counting_type
+		fullTSFlag, _ := br.readBits(1)
+		br.readBits(1) // discontinuity_flag
+		br.readBits(1) // cnt_dropped_flag
+		nFrames, _ := br.readBits(9)
+
+		var secs, mins, hours uint
+		if fullTSFlag == 1 {
+			secs, _ = br.readBits(6)
+			mins, _ = br.readBits(6)
+			hours, _ = br.readBits(5)
+		} else {
+			secFlag, _ := br.readBits(1)
+			if secFlag == 1 {
+				secs, _ = br.readBits(6)
+				minFlag, _ := br.readBits(1)
+				if minFlag == 1 {
+					mins, _ = br.readBits(6)
+					hrFlag, _ := br.readBits(1)
+					if hrFlag == 1 {
+						hours, _ = br.readBits(5)
+					}
+				}
+			}
+		}
+
+		timeOffsetLen, _ := br.readBits(5)
+		if timeOffsetLen > 0 {
+			br.readBits(int(timeOffsetLen))
+		}
+
+		return Timecode{
+			Hours:   int(hours),
+			Minutes: int(mins),
+			Seconds: int(secs),
+			Frames:  int(nFrames),
+		}, true
+	}
+
+	return Timecode{}, false
+}
+
+// findSEIPayload walks the SEI RBSP (with NAL header already stripped and
+// emulation prevention bytes removed) and returns the raw payload bytes for
+// the first message matching targetType, or nil if not found.
+func findSEIPayload(rbsp []byte, targetType int) []byte {
+	i := 0
+	for i < len(rbsp) {
+		if rbsp[i] == 0x80 {
+			break
+		}
+
+		payloadType := 0
+		for i < len(rbsp) && rbsp[i] == 0xFF {
+			payloadType += 255
+			i++
+		}
+		if i >= len(rbsp) {
+			break
+		}
+		payloadType += int(rbsp[i])
+		i++
+
+		payloadSize := 0
+		for i < len(rbsp) && rbsp[i] == 0xFF {
+			payloadSize += 255
+			i++
+		}
+		if i >= len(rbsp) {
+			break
+		}
+		payloadSize += int(rbsp[i])
+		i++
+
+		if i+payloadSize > len(rbsp) {
+			break
+		}
+
+		if payloadType == targetType {
+			return rbsp[i : i+payloadSize]
+		}
+		i += payloadSize
+	}
+
+	return nil
+}
