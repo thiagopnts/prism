@@ -312,9 +312,11 @@ func (d *Demuxer) handleVideoH264(ctx context.Context, data []byte, pts, dts int
 					d.stats.RecordResolution(info.Width, info.Height)
 				}
 			}
+			continue
 		case IsPPS(nalu.Type):
 			d.pps = make([]byte, len(nalu.Data))
 			copy(d.pps, nalu.Data)
+			continue
 		case IsKeyframe(nalu.Type):
 			isKeyframe = true
 		case nalu.Type == NALTypeSEI:
@@ -358,6 +360,7 @@ func (d *Demuxer) handleVideoHEVC(ctx context.Context, data []byte, pts, dts int
 		case IsHEVCVPS(nalu.Type):
 			d.vps = make([]byte, len(nalu.Data))
 			copy(d.vps, nalu.Data)
+			continue
 		case IsHEVCSPS(nalu.Type):
 			d.sps = make([]byte, len(nalu.Data))
 			copy(d.sps, nalu.Data)
@@ -367,9 +370,11 @@ func (d *Demuxer) handleVideoHEVC(ctx context.Context, data []byte, pts, dts int
 					d.stats.RecordResolution(info.Width, info.Height)
 				}
 			}
+			continue
 		case IsHEVCPPS(nalu.Type):
 			d.pps = make([]byte, len(nalu.Data))
 			copy(d.pps, nalu.Data)
+			continue
 		case IsHEVCKeyframe(nalu.Type):
 			isKeyframe = true
 		case nalu.Type == HEVCNALSEIPrefix:
