@@ -317,7 +317,6 @@ func (d *Demuxer) handleVideoH264(ctx context.Context, data []byte, pts, dts int
 		case IsSPS(nalu.Type):
 			d.sps = make([]byte, len(nalu.Data))
 			copy(d.sps, nalu.Data)
-			isKeyframe = true
 			if info, err := ParseSPS(nalu.Data); err == nil {
 				d.spsInfo = info
 				if d.stats != nil {
