@@ -51,7 +51,7 @@ func TestBuildMoQCatalogBasic(t *testing.T) {
 	if cat.Tracks[1].Name != "audio0" {
 		t.Fatalf("tracks[1].name = %q", cat.Tracks[1].Name)
 	}
-	if cat.Tracks[1].SelectionParams.Codec != "mp4a.40.02" {
+	if cat.Tracks[1].SelectionParams.Codec != "mp4a.40.2" {
 		t.Fatalf("audio codec = %q", cat.Tracks[1].SelectionParams.Codec)
 	}
 	if cat.Tracks[1].SelectionParams.SampleRate != 48000 {
@@ -166,7 +166,14 @@ func TestBuildMoQCatalogJSONFieldNames(t *testing.T) {
 func TestBuildMoQCatalogCustomAudioInfo(t *testing.T) {
 	t.Parallel()
 	relay := NewRelay()
-	relay.SetAudioInfo(AudioInfo{Codec: "mp4a.40.05", SampleRate: 44100, Channels: 1})
+	// 7.1 stream: channel_configuration=7, actual count=8. Catalog must emit
+	// the configuration value, not the count.
+	relay.SetAudioInfo(AudioInfo{
+		Codec:         "mp4a.40.5",
+		SampleRate:    44100,
+		Channels:      8,
+		ChannelConfig: 7,
+	})
 
 	data, err := buildMoQCatalog("custom-audio", relay, false)
 	if err != nil {
@@ -179,14 +186,14 @@ func TestBuildMoQCatalogCustomAudioInfo(t *testing.T) {
 	}
 
 	ap := cat.Tracks[1].SelectionParams
-	if ap.Codec != "mp4a.40.05" {
+	if ap.Codec != "mp4a.40.5" {
 		t.Fatalf("audio codec = %q", ap.Codec)
 	}
 	if ap.SampleRate != 44100 {
 		t.Fatalf("audio sampleRate = %d", ap.SampleRate)
 	}
-	if ap.ChannelConfig != "1" {
-		t.Fatalf("audio channelConfig = %q", ap.ChannelConfig)
+	if ap.ChannelConfig != "7" {
+		t.Fatalf("audio channelConfig = %q, want \"7\" (config, not count)", ap.ChannelConfig)
 	}
 }
 

@@ -185,9 +185,10 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			}
 			if !p.audioInfoSent && frame.SampleRate > 0 {
 				p.relay.SetAudioInfo(distribution.AudioInfo{
-					Codec:      "mp4a.40.02",
-					SampleRate: frame.SampleRate,
-					Channels:   frame.Channels,
+					Codec:         frame.Codec,
+					SampleRate:    frame.SampleRate,
+					Channels:      frame.Channels,
+					ChannelConfig: frame.ChannelConfig,
 				})
 				p.audioInfoSent = true
 			}

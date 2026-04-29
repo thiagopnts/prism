@@ -50,9 +50,9 @@ func TestDemuxStatsRecordAudioFrame(t *testing.T) {
 
 	ds := NewDemuxStats()
 
-	ds.RecordAudioFrame(0, 200, 90000, 48000, 2)
-	ds.RecordAudioFrame(0, 200, 92000, 48000, 2)
-	ds.RecordAudioFrame(1, 100, 90000, 44100, 1)
+	ds.RecordAudioFrame(0, 200, 90000, 48000, 2, "mp4a.40.2")
+	ds.RecordAudioFrame(0, 200, 92000, 48000, 2, "mp4a.40.2")
+	ds.RecordAudioFrame(1, 100, 90000, 44100, 1, "mp4a.40.2")
 
 	_, audio, _, _ := ds.Snapshot()
 	if len(audio) != 2 {
@@ -175,7 +175,7 @@ func TestDemuxStatsConcurrentAccess(t *testing.T) {
 		}(i)
 		go func(n int) {
 			defer wg.Done()
-			ds.RecordAudioFrame(n%3, int64(n*50), int64(n*2000), 48000, 2)
+			ds.RecordAudioFrame(n%3, int64(n*50), int64(n*2000), 48000, 2, "mp4a.40.2")
 		}(i)
 		go func(n int) {
 			defer wg.Done()
@@ -205,8 +205,8 @@ func TestDemuxStatsFirstPTS(t *testing.T) {
 
 	ds.RecordVideoFrame(1000, true, 90000)
 	ds.RecordVideoFrame(500, false, 93000)
-	ds.RecordAudioFrame(0, 200, 80000, 48000, 2)
-	ds.RecordAudioFrame(0, 200, 82000, 48000, 2)
+	ds.RecordAudioFrame(0, 200, 80000, 48000, 2, "mp4a.40.2")
+	ds.RecordAudioFrame(0, 200, 82000, 48000, 2, "mp4a.40.2")
 
 	debug := ds.PTSDebug()
 	if debug.FirstVideoPTS != 90000 {

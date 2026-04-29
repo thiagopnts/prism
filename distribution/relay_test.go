@@ -408,14 +408,18 @@ func TestRelayAudioInfo(t *testing.T) {
 
 	// Default
 	ai := r.AudioInfo()
-	if ai.Codec != "mp4a.40.02" {
-		t.Errorf("default codec: got %q, want mp4a.40.02", ai.Codec)
+	if ai.Codec != "mp4a.40.2" {
+		t.Errorf("default codec: got %q, want mp4a.40.2", ai.Codec)
+	}
+	if ai.ChannelConfig != 2 {
+		t.Errorf("default ChannelConfig: got %d, want 2", ai.ChannelConfig)
 	}
 
-	r.SetAudioInfo(AudioInfo{Codec: "mp4a.40.02", SampleRate: 44100, Channels: 1})
+	r.SetAudioInfo(AudioInfo{Codec: "mp4a.40.2", SampleRate: 44100, Channels: 1, ChannelConfig: 1})
 	ai = r.AudioInfo()
-	if ai.SampleRate != 44100 || ai.Channels != 1 {
-		t.Errorf("AudioInfo: got %d/%d, want 44100/1", ai.SampleRate, ai.Channels)
+	if ai.SampleRate != 44100 || ai.Channels != 1 || ai.ChannelConfig != 1 {
+		t.Errorf("AudioInfo: got %d/%d/cfg=%d, want 44100/1/cfg=1",
+			ai.SampleRate, ai.Channels, ai.ChannelConfig)
 	}
 }
 

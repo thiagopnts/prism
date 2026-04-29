@@ -30,10 +30,18 @@ type VideoFrame struct {
 // AudioFrame represents a single AAC audio frame (ADTS-wrapped) belonging
 // to a specific audio track. Multi-track streams produce separate AudioFrames
 // with distinct TrackIndex values.
+//
+// Channels is the actual channel count derived from the ADTS
+// channel_configuration via ISO/IEC 14496-3 Table 1.19 (cfg=7 → 8 channels).
+// ChannelConfig is the raw 3-bit configuration value (0–7) preserved for
+// downstream consumers like the MoQ catalog. Codec is the canonical MIME-style
+// codec id ("mp4a.40.<AOT>") derived from the ADTS profile field.
 type AudioFrame struct {
-	PTS        int64
-	Data       []byte
-	SampleRate int
-	Channels   int
-	TrackIndex int
+	PTS           int64
+	Data          []byte
+	SampleRate    int
+	Channels      int
+	ChannelConfig uint8
+	Codec         string
+	TrackIndex    int
 }

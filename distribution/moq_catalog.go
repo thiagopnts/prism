@@ -79,7 +79,7 @@ func buildMoQCatalog(streamKey string, relay *Relay, controlEnabled bool) ([]byt
 			SelectionParams: moqSelectionParams{
 				Codec:         ai.Codec,
 				SampleRate:    ai.SampleRate,
-				ChannelConfig: fmt.Sprintf("%d", ai.Channels),
+				ChannelConfig: fmt.Sprintf("%d", ai.ChannelConfig),
 			},
 		})
 	}

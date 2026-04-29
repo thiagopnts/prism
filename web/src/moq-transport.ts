@@ -27,6 +27,17 @@ import {
 	readVarintFromBuffer,
 } from "./moq-constants";
 
+// AAC channel_configuration → channel count, ISO/IEC 14496-3 Table 1.19.
+// Index 0 means "defined elsewhere" (PCE); count is unknown so we report 0.
+const AAC_CHANNEL_COUNTS = [0, 1, 2, 3, 4, 5, 6, 8] as const;
+
+function aacChannelCountFromConfig(channelConfig: string | undefined): number {
+	if (!channelConfig) return 0;
+	const cfg = parseInt(channelConfig, 10);
+	if (Number.isNaN(cfg) || cfg < 0 || cfg >= AAC_CHANNEL_COUNTS.length) return 0;
+	return AAC_CHANNEL_COUNTS[cfg];
+}
+
 /** Callbacks delivered by MoQTransport to the player. */
 export interface MoQTransportCallbacks {
 	onTrackInfo: (tracks: TrackInfo[]) => void | Promise<void>;
@@ -562,7 +573,7 @@ export class MoQTransport {
 					width: 0,
 					height: 0,
 					sampleRate: sp.samplerate ?? 0,
-					channels: sp.channelConfig ? parseInt(sp.channelConfig, 10) : 0,
+					channels: aacChannelCountFromConfig(sp.channelConfig),
 					trackIndex: idx,
 					label: `Audio ${idx + 1}`,
 				});

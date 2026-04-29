@@ -179,6 +179,7 @@ type audioTrackAccum struct {
 	LastPTS    atomic.Int64
 	SampleRate int
 	Channels   int
+	Codec      string // canonical codec id (e.g. "mp4a.40.2"); set on first frame
 }
 
 type bitrateEntry struct {
@@ -249,8 +250,9 @@ func (ds *DemuxStats) RecordVideoFrame(bytes int64, isKeyframe bool, pts int64) 
 }
 
 // RecordAudioFrame records an audio frame for the given track, creating the
-// per-track accumulator on first use.
-func (ds *DemuxStats) RecordAudioFrame(trackIdx int, bytes int64, pts int64, sampleRate, channels int) {
+// per-track accumulator on first use. Codec is captured once (it is stable
+// per track) so subsequent calls cost only the lookup.
+func (ds *DemuxStats) RecordAudioFrame(trackIdx int, bytes int64, pts int64, sampleRate, channels int, codec string) {
 	if !ds.firstAudioSet.Load() {
 		ds.firstAudioPTS.Store(pts)
 		ds.firstAudioSet.Store(true)
@@ -259,7 +261,7 @@ func (ds *DemuxStats) RecordAudioFrame(trackIdx int, bytes int64, pts int64, sam
 	ds.mu.Lock()
 	acc, ok := ds.audioStats[trackIdx]
 	if !ok {
-		acc = &audioTrackAccum{SampleRate: sampleRate, Channels: channels}
+		acc = &audioTrackAccum{SampleRate: sampleRate, Channels: channels, Codec: codec}
 		ds.audioStats[trackIdx] = acc
 	}
 	ds.mu.Unlock()
@@ -331,6 +333,29 @@ func (ds *DemuxStats) RecordVideoCodec(codec string) {
 	ds.videoCodecMu.Lock()
 	ds.videoCodec = codec
 	ds.videoCodecMu.Unlock()
+}
+
+// audioCodecLabel translates a canonical mp4a codec id into a human-readable
+// label for stats display. Falls back to the input when no mapping exists.
+func audioCodecLabel(codec string) string {
+	switch codec {
+	case "":
+		return ""
+	case "mp4a.40.1":
+		return "AAC-MAIN"
+	case "mp4a.40.2":
+		return "AAC-LC"
+	case "mp4a.40.3":
+		return "AAC-SSR"
+	case "mp4a.40.4":
+		return "AAC-LTP"
+	case "mp4a.40.5":
+		return "HE-AAC"
+	case "mp4a.40.29":
+		return "HE-AACv2"
+	default:
+		return codec
+	}
 }
 
 // RecordResolution stores the detected video resolution from an SPS.
@@ -455,7 +480,7 @@ func (ds *DemuxStats) Snapshot() (VideoStats, []AudioTrackStats, CaptionStats, S
 		}
 		audioTracks = append(audioTracks, AudioTrackStats{
 			TrackIndex:  idx,
-			Codec:       "AAC-LC",
+			Codec:       audioCodecLabel(acc.Codec),
 			SampleRate:  acc.SampleRate,
 			Channels:    acc.Channels,
 			Frames:      totalFrames,
