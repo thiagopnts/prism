@@ -5,7 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"strings"
+
 	"time"
 
 	"github.com/zsiec/ccx"
@@ -559,25 +559,36 @@ func (d *Demuxer) handleTeletext(ctx context.Context, pes *mpegts.PESData, td *t
 	}
 
 	for _, out := range td.processTeletextPES(pes.Data, pts) {
-		if len(out.lines) == 0 {
-			continue
-		}
-		text := strings.Join(out.lines, "\n")
+		channel := td.channelForPage(td.currentPage)
 		frame := &ccx.CaptionFrame{
 			PTS:     out.pts,
-			Text:    text,
-			Channel: teletextChannel,
+			Channel: channel,
 		}
-		var rows []ccx.CaptionRow
-		for i, line := range out.lines {
+
+		rows := make([]ccx.CaptionRow, 0, len(out.lines))
+		for _, line := range out.lines {
+			spans := make([]ccx.CaptionSpan, 0, len(line.spans))
+			for _, sp := range line.spans {
+				spans = append(spans, ccx.CaptionSpan{
+					Text:    sp.text,
+					FgColor: sp.fgColor,
+					BgColor: sp.bgColor,
+				})
+			}
 			rows = append(rows, ccx.CaptionRow{
-				Row:   i,
-				Spans: []ccx.CaptionSpan{{Text: line}},
+				Row:   line.rowNum,
+				Spans: spans,
 			})
 		}
-		frame.Regions = []ccx.CaptionRegion{{Rows: rows}}
+
+		frame.Regions = []ccx.CaptionRegion{{
+			Rows:        rows,
+			FillColor:   colorBlack,
+			BorderColor: colorBlack,
+		}}
+
 		if d.stats != nil {
-			d.stats.RecordCaption(teletextChannel)
+			d.stats.RecordCaption(channel)
 		}
 		select {
 		case d.captionCh <- frame:

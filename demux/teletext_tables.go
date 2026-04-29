@@ -21,18 +21,53 @@ var hammingDecode84 = [256]byte{
 	0x08, 0xFF, 0xFF, 0x05, 0xFF, 0x0E, 0x0D, 0xFF, 0xFF, 0x0E, 0x0F, 0xFF, 0x0E, 0x0E, 0xFF, 0x0E,
 }
 
-// bitReverse maps each byte to its bit-reversed form. Teletext data in MPEG-TS
-// is stored MSB-first but the teletext standard transmits LSB-first.
-var bitReverse [256]byte
+// nationalSubset holds the 13 G0 character positions that vary between
+// languages per EN 300 706 Annex A. Each entry overrides codes:
+//
+//	0x23 0x24 0x40 0x5B 0x5C 0x5D 0x5E 0x5F 0x60 0x7B 0x7C 0x7D 0x7E
+type nationalSubset [13]rune
 
-func init() {
-	for i := 0; i < 256; i++ {
-		var r byte
-		for bit := 0; bit < 8; bit++ {
-			r |= ((byte(i) >> bit) & 1) << (7 - bit)
-		}
-		bitReverse[i] = r
-	}
+var nationalPositions = [13]byte{
+	0x23, 0x24, 0x40, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F, 0x60, 0x7B, 0x7C, 0x7D, 0x7E,
+}
+
+// G0 national option character subsets per EN 300 706 Annex A, Table 36.
+// Each entry replaces the 13 national-option positions in g0Latin.
+var frenchSubset = nationalSubset{'é', 'ï', 'à', 'ë', 'ê', 'ù', 'î', '#', 'è', 'â', 'ô', 'û', 'ç'}
+
+// subset 1 – German
+var germanSubset = nationalSubset{'#', '$', '§', 'Ä', 'Ö', 'Ü', '^', '_', '°', 'ä', 'ö', 'ü', 'ß'}
+
+// subset 2 – Swedish / Finnish / Hungarian
+var swedishSubset = nationalSubset{'#', '¤', 'É', 'Ä', 'Ö', 'Å', 'Ü', '_', 'é', 'ä', 'ö', 'å', 'ü'}
+
+// subset 3 – Italian
+var italianSubset = nationalSubset{'£', '$', 'é', '°', 'ç', '→', '^', '#', 'ù', 'à', 'ò', 'è', 'ì'}
+
+// subset 5 – Portuguese / Spanish
+var spanishSubset = nationalSubset{'ç', '$', '¡', 'á', 'é', 'í', 'ó', 'ú', '¿', 'ü', 'ñ', 'è', 'â'}
+
+// subset 6 – Czech / Slovak
+var czechSubset = nationalSubset{'#', 'ů', 'č', 'ř', 'š', 'ě', 'ž', 'ý', 'á', 'í', 'é', 'ú', 'ů'}
+
+// nationalSubsets maps ISO 639-2 language codes (both T and B variants where
+// they differ) to G0 national option overrides. Languages not listed fall
+// through to the default G0 Latin set (English/subset 0).
+var nationalSubsets = map[string]nationalSubset{
+	"fra": frenchSubset,
+	"fre": frenchSubset,
+	"deu": germanSubset,
+	"ger": germanSubset,
+	"swe": swedishSubset,
+	"fin": swedishSubset,
+	"hun": swedishSubset,
+	"ita": italianSubset,
+	"spa": spanishSubset,
+	"por": spanishSubset,
+	"ces": czechSubset,
+	"cze": czechSubset,
+	"slk": czechSubset,
+	"slo": czechSubset,
 }
 
 // g0Latin maps 7-bit teletext character codes to Unicode runes using the
@@ -45,16 +80,16 @@ var g0Latin = [128]rune{
 	' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
 	' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
 	// 0x20-0x7F: standard G0 Latin (mostly ASCII)
-	' ', '!', '"', '\u00a3', '$', '%', '&', '\'',
+	' ', '!', '"', '£', '$', '%', '&', '\'',
 	'(', ')', '*', '+', ',', '-', '.', '/',
 	'0', '1', '2', '3', '4', '5', '6', '7',
 	'8', '9', ':', ';', '<', '=', '>', '?',
 	'@', 'A', 'B', 'C', 'D', 'E', 'F', 'G',
 	'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
 	'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W',
-	'X', 'Y', 'Z', '\u2190', '\u00bd', '\u2192', '\u2191', '#',
-	'\u2014', 'a', 'b', 'c', 'd', 'e', 'f', 'g',
+	'X', 'Y', 'Z', '←', '½', '→', '↑', '#',
+	'—', 'a', 'b', 'c', 'd', 'e', 'f', 'g',
 	'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
 	'p', 'q', 'r', 's', 't', 'u', 'v', 'w',
-	'x', 'y', 'z', '\u00bc', '\u2016', '\u00be', '\u00f7', '\u25a0',
+	'x', 'y', 'z', '¼', '‖', '¾', '÷', '■',
 }
