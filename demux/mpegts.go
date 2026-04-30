@@ -32,7 +32,7 @@ type AudioTrackInfo struct {
 // telemetry. The distribution layer's DemuxStats implements this interface.
 type StatsRecorder interface {
 	RecordVideoFrame(bytes int64, isKeyframe bool, pts int64)
-	RecordAudioFrame(trackIdx int, bytes int64, pts int64, sampleRate, channels int, codec string)
+	RecordAudioFrame(trackIdx int, bytes int64, pts int64, sampleRate, channels int)
 	RecordCaption(channel int)
 	RecordResolution(width, height int)
 	RecordTimecode(tc string)
@@ -683,28 +683,22 @@ func (d *Demuxer) handleAudio(ctx context.Context, pes *mpegts.PESData, trackInd
 		return
 	}
 
-	// 1024-samples-per-frame stride is safe because ParseADTS rejects frames
-	// with number_of_raw_data_blocks_in_frame > 0.
 	for i, aac := range aacFrames {
 		framePTS := pts
 		if aac.SampleRate > 0 {
 			framePTS += int64(i) * 1024 * 1_000_000 / int64(aac.SampleRate)
 		}
 
-		codec := AACCodecString(aac.AOT)
-
 		frame := &media.AudioFrame{
-			PTS:           framePTS,
-			Data:          aac.Data,
-			SampleRate:    aac.SampleRate,
-			Channels:      aac.Channels,
-			ChannelConfig: aac.ChannelConfig,
-			Codec:         codec,
-			TrackIndex:    trackIndex,
+			PTS:        framePTS,
+			Data:       aac.Data,
+			SampleRate: aac.SampleRate,
+			Channels:   aac.Channels,
+			TrackIndex: trackIndex,
 		}
 
 		if d.stats != nil {
-			d.stats.RecordAudioFrame(trackIndex, int64(len(aac.Data)), framePTS, aac.SampleRate, aac.Channels, codec)
+			d.stats.RecordAudioFrame(trackIndex, int64(len(aac.Data)), framePTS, aac.SampleRate, aac.Channels)
 		}
 
 		select {

@@ -31,23 +31,12 @@ type VideoInfo struct {
 }
 
 // AudioInfo holds the audio codec parameters for a single track, derived
-// from the first ADTS frame seen by the demuxer. Channels is the actual
-// channel count (cfg=7 → 8); ChannelConfig is the raw 0–7 MPEG-4 channel
-// configuration index that the MoQ catalog needs.
+// from the first ADTS frame seen by the demuxer.
 type AudioInfo struct {
-	Codec         string
-	SampleRate    int
-	Channels      int
-	ChannelConfig uint8
+	Codec      string
+	SampleRate int
+	Channels   int
 }
-
-// Default audio parameters used when no audio frame has been observed yet.
-const (
-	defaultAudioCodec         = "mp4a.40.2" // AAC-LC
-	defaultAudioSampleRate    = 48000
-	defaultAudioChannels      = 2
-	defaultAudioChannelConfig = uint8(2)
-)
 
 // audioCacheSize is the number of recent audio frames cached per track
 // for replay to late-joining subscribers (~1 second at ~23ms/frame for AAC).
@@ -147,12 +136,7 @@ func (r *Relay) AudioInfo() AudioInfo {
 	if r.audioInfoSet {
 		return r.audioInfo
 	}
-	return AudioInfo{
-		Codec:         defaultAudioCodec,
-		SampleRate:    defaultAudioSampleRate,
-		Channels:      defaultAudioChannels,
-		ChannelConfig: defaultAudioChannelConfig,
-	}
+	return AudioInfo{Codec: "mp4a.40.02", SampleRate: 48000, Channels: 2}
 }
 
 // AddViewer replays the cached GOP to the viewer, then registers it for
