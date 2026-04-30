@@ -86,6 +86,7 @@ type teletextLine struct {
 type teletextOutput struct {
 	lines []teletextLine
 	pts   int64
+	page  uint16 // source page (mag<<8 | bcd) the lines/erase were collected for
 }
 
 type teletextDecoder struct {
@@ -223,7 +224,7 @@ func (td *teletextDecoder) handlePageHeader(data []byte, magazine uint8, pts int
 	if td.collecting {
 		lines := extractPageLines(&td.page)
 		if len(lines) > 0 {
-			outputs = append(outputs, teletextOutput{lines: lines, pts: td.page.pts})
+			outputs = append(outputs, teletextOutput{lines: lines, pts: td.page.pts, page: td.currentPage})
 		}
 	}
 
@@ -238,7 +239,7 @@ func (td *teletextDecoder) handlePageHeader(data []byte, magazine uint8, pts int
 	// Erase page: append an explicit empty output so the caller can clear the
 	// subtitle display. This follows any pending content already appended above.
 	if isSubtitle && erasePage {
-		outputs = append(outputs, teletextOutput{pts: pts})
+		outputs = append(outputs, teletextOutput{pts: pts, page: page})
 	}
 
 	return outputs

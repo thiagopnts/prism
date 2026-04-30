@@ -559,7 +559,7 @@ func (d *Demuxer) handleTeletext(ctx context.Context, pes *mpegts.PESData, td *t
 	}
 
 	for _, out := range td.processTeletextPES(pes.Data, pts) {
-		channel := td.channelForPage(td.currentPage)
+		channel := td.channelForPage(out.page)
 		frame := &ccx.CaptionFrame{
 			PTS:     out.pts,
 			Channel: channel,

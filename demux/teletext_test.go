@@ -574,6 +574,58 @@ func TestTeletextMultiPageChannels(t *testing.T) {
 	}
 }
 
+func TestTeletextOutputPageRouting(t *testing.T) {
+	t.Parallel()
+	// Two subtitle pages on one PID: eng 1/0x88 → channel 100, ger 2/0x89 → 101.
+	// A single PES that closes the eng page (gerHeader) then closes the ger
+	// page (engHeader2) must produce two outputs whose `page` fields match the
+	// page each was collected for, not the decoder's post-loop currentPage.
+	data := []byte{
+		'e', 'n', 'g', 0x11, 0x88,
+		'g', 'e', 'r', 0x12, 0x89,
+	}
+	td := newTeletextDecoder(parseTeletextDescriptor(data))
+	if td == nil {
+		t.Fatal("expected non-nil decoder")
+	}
+
+	const engPage uint16 = 0x188
+	const gerPage uint16 = 0x289
+
+	pes := buildTeletextPES(
+		buildPageHeader(1, 0x88),
+		buildDisplayRow(1, 21, "Hello"),
+		buildPageHeader(2, 0x89),
+		buildDisplayRow(2, 21, "Hallo"),
+		buildPageHeader(1, 0x88),
+	)
+	results := td.processTeletextPES(pes, 1000)
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+
+	if results[0].page != engPage {
+		t.Errorf("result[0].page = 0x%x, want 0x%x (eng)", results[0].page, engPage)
+	}
+	if ch := td.channelForPage(results[0].page); ch != 100 {
+		t.Errorf("result[0] channel = %d, want 100", ch)
+	}
+	if text := linesText(results[0].lines); !strings.Contains(text, "Hello") {
+		t.Errorf("result[0] text missing 'Hello': %q", text)
+	}
+
+	if results[1].page != gerPage {
+		t.Errorf("result[1].page = 0x%x, want 0x%x (ger)", results[1].page, gerPage)
+	}
+	if ch := td.channelForPage(results[1].page); ch != 101 {
+		t.Errorf("result[1] channel = %d, want 101", ch)
+	}
+	if text := linesText(results[1].lines); !strings.Contains(text, "Hallo") {
+		t.Errorf("result[1] text missing 'Hallo': %q", text)
+	}
+}
+
 // buildPageHeaderWithErase constructs a row-0 data unit with the C5 (erase page)
 // control bit optionally set. C5 is bit D3 (bit 2) of the Hamming-encoded byte
 // at data[8] per EN 300 706 §9.3.1.
