@@ -340,15 +340,14 @@ func TestMoQWriterAudioFrame(t *testing.T) {
 	payloadLen, nn, _ := quicvarint.Parse(data[pos:])
 	pos += nn
 
-	// Payload should be the full ADTS frame (header + payload, 11 bytes); we no
-	// longer strip ADTS so the WebCodecs decoder can run in adts mode.
-	if payloadLen != uint64(len(adts)) {
-		t.Errorf("payload length: got %d, want %d", payloadLen, len(adts))
+	// Payload should be raw AAC (ADTS stripped: 4 bytes)
+	if payloadLen != 4 {
+		t.Errorf("payload length: got %d, want 4", payloadLen)
 	}
 
 	payload := data[pos : pos+int(payloadLen)]
-	if !bytes.Equal(payload, adts) {
-		t.Errorf("payload mismatch: got %x, want %x", payload, adts)
+	if !bytes.Equal(payload, []byte{0xDE, 0xAD, 0xBE, 0xEF}) {
+		t.Errorf("payload mismatch: got %x", payload)
 	}
 }
 

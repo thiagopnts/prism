@@ -1,77 +1,20 @@
 package demux
 
-import (
-	"errors"
+import "errors"
 
-	"github.com/zsiec/prism/mpegts"
-)
+// aacCodecStrings maps AOT (1..4) to the canonical MIME-style codec id.
+// Built once at init to avoid per-frame fmt.Sprintf in the demuxer hot path.
+var aacCodecStrings = [...]string{"", "mp4a.40.1", "mp4a.40.2", "mp4a.40.3", "mp4a.40.4"}
 
-// MPEG-4 Audio Object Types referenced by the demuxer. ADTS profile bits
-// only express AOT 1..4; HE-AAC (5) and HE-AAC v2 (29) reach the demuxer via
-// PMT descriptor (tag 0x1C) signaling.
-const (
-	aotAACLC   uint8 = 2
-	aotHEAAC   uint8 = 5
-	aotHEAACv2 uint8 = 29
-)
-
-// AACCodecString returns "mp4a.40.<AOT>" for the given Audio Object Type, or
-// the empty string for AOTs we don't support.
+// AACCodecString returns "mp4a.40.<AOT>" for the given Audio Object Type.
+// Falls back to a runtime-formatted string for AOTs outside the ADTS range
+// (1..4); production ADTS streams never trigger the fallback because the
+// 2-bit profile field caps AOT at 4.
 func AACCodecString(aot uint8) string {
-	switch aot {
-	case 1:
-		return "mp4a.40.1"
-	case aotAACLC:
-		return "mp4a.40.2"
-	case 3:
-		return "mp4a.40.3"
-	case 4:
-		return "mp4a.40.4"
-	case aotHEAAC:
-		return "mp4a.40.5"
-	case aotHEAACv2:
-		return "mp4a.40.29"
+	if int(aot) < len(aacCodecStrings) && aacCodecStrings[aot] != "" {
+		return aacCodecStrings[aot]
 	}
 	return ""
-}
-
-// MPEG-4 audio descriptor tag (ISO/IEC 13818-1 §2.6.40) carrying a single
-// audioProfileLevelIndication byte that identifies the MPEG-4 Audio profile
-// and level for this elementary stream.
-const descriptorTagMPEG4Audio = 0x1C
-
-// aotFromAudioProfileLevel maps an MPEG-4 audioProfileLevelIndication value
-// (ISO/IEC 14496-3 §1.6.6 Table 1.14) to the Audio Object Type implied by
-// that profile/level. Returns 0 for values outside the AAC family.
-//
-// Profile levels collapse to a single AOT: anything in the HE-AAC family
-// becomes AOT 5, anything in the HE-AAC v2 family becomes AOT 29. The level
-// distinction is not load-bearing for WebCodecs decoder configuration.
-func aotFromAudioProfileLevel(apli uint8) uint8 {
-	switch apli {
-	case 0x28, 0x29, 0x2A, 0x2B:
-		return aotAACLC
-	case 0x2C, 0x2D, 0x2E, 0x2F, 0x34, 0x35:
-		return aotHEAAC
-	case 0x30, 0x31, 0x32, 0x33, 0x36, 0x37:
-		return aotHEAACv2
-	}
-	return 0
-}
-
-// audioProfileAOTFromDescriptors scans elementary stream descriptors for the
-// MPEG-4 audio descriptor and returns its mapped AOT, or 0 if no such
-// descriptor is present. Used to detect HE-AAC streams that explicitly
-// signal SBR/PS via PMT (the ADTS profile bits cannot).
-func audioProfileAOTFromDescriptors(descs []mpegts.PMTDescriptor) uint8 {
-	for _, d := range descs {
-		if d.Tag == descriptorTagMPEG4Audio && len(d.Data) >= 1 {
-			if aot := aotFromAudioProfileLevel(d.Data[0]); aot != 0 {
-				return aot
-			}
-		}
-	}
-	return 0
 }
 
 // ErrInvalidADTS is returned when the ADTS sync word or header is malformed.
