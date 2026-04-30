@@ -73,7 +73,12 @@ type Demuxer struct {
 	videoPID     uint16
 	audioPIDs    map[uint16]int
 	audioTracks  []AudioTrackInfo
-	teletextPIDs map[uint16]*teletextDecoder
+	// audioProfileAOT[trackIdx] is the MPEG-4 AOT signaled by the PMT MPEG-4
+	// audio descriptor (tag 0x1C) for that track, or 0 if no such descriptor
+	// was present. Used to detect HE-AAC / HE-AAC v2 since ADTS profile bits
+	// only express AOT 1..4.
+	audioProfileAOT map[int]uint8
+	teletextPIDs    map[uint16]*teletextDecoder
 	pmtReady     chan struct{}
 	pmtDone      bool
 	isHEVC       bool
@@ -104,9 +109,10 @@ func NewDemuxer(r io.Reader, log *slog.Logger) *Demuxer {
 		videoCh:      make(chan *media.VideoFrame, media.VideoBufferSize),
 		audioCh:      make(chan *media.AudioFrame, media.AudioBufferSize),
 		captionCh:    make(chan *ccx.CaptionFrame, media.CaptionBufferSize),
-		audioPIDs:    make(map[uint16]int),
-		teletextPIDs: make(map[uint16]*teletextDecoder),
-		pmtReady:     make(chan struct{}),
+		audioPIDs:       make(map[uint16]int),
+		audioProfileAOT: make(map[int]uint8),
+		teletextPIDs:    make(map[uint16]*teletextDecoder),
+		pmtReady:        make(chan struct{}),
 		cea708Svcs: map[int]*ccx.CEA708Service{
 			1: ccx.NewCEA708Service(),
 			2: ccx.NewCEA708Service(),
@@ -232,7 +238,14 @@ func (d *Demuxer) Run(ctx context.Context) error {
 							PID:        es.ElementaryPID,
 							TrackIndex: audioIdx,
 						})
-						d.log.Info("found audio PID", "pid", es.ElementaryPID, "trackIndex", audioIdx)
+						profileAOT := audioProfileAOTFromDescriptors(es.Descriptors)
+						if profileAOT != 0 {
+							d.audioProfileAOT[audioIdx] = profileAOT
+						}
+						d.log.Info("found audio PID",
+							"pid", es.ElementaryPID,
+							"trackIndex", audioIdx,
+							"profileAOT", profileAOT)
 						audioIdx++
 					}
 				case streamTypePrivateData:
@@ -683,28 +696,53 @@ func (d *Demuxer) handleAudio(ctx context.Context, pes *mpegts.PESData, trackInd
 		return
 	}
 
+	profileAOT := d.audioProfileAOT[trackIndex]
+
 	// 1024-samples-per-frame stride is safe because ParseADTS rejects frames
-	// with number_of_raw_data_blocks_in_frame > 0.
+	// with number_of_raw_data_blocks_in_frame > 0. The stride uses the encoded
+	// (ADTS-reported) sample rate, which is correct even for HE-AAC where the
+	// post-SBR output rate is doubled — PTS spacing is in encoded samples.
 	for i, aac := range aacFrames {
 		framePTS := pts
 		if aac.SampleRate > 0 {
 			framePTS += int64(i) * 1024 * 1_000_000 / int64(aac.SampleRate)
 		}
 
-		codec := AACCodecString(aac.AOT)
+		aot := aac.AOT
+		sampleRate := aac.SampleRate
+		channels := aac.Channels
+		channelConfig := aac.ChannelConfig
+
+		// PMT MPEG-4 audio descriptor signaled HE-AAC. The ADTS profile field
+		// can only express AOT 1..4, so it always says "LC" for HE-AAC streams;
+		// trust the descriptor and apply post-SBR/PS output dimensions so the
+		// WebCodecs decoder is configured for the actual decoded output.
+		if profileAOT == aotHEAAC || profileAOT == aotHEAACv2 {
+			aot = profileAOT
+			sampleRate = aac.SampleRate * 2 // SBR doubles the output sample rate
+			if profileAOT == aotHEAACv2 {
+				// HE-AAC v2: PS extends mono LC to stereo output. ADTS reports
+				// channel_configuration=1 (mono); advertise stereo so the
+				// decoder/ring buffer are sized for the PS output.
+				channels = 2
+				channelConfig = 2
+			}
+		}
+
+		codec := AACCodecString(aot)
 
 		frame := &media.AudioFrame{
 			PTS:           framePTS,
 			Data:          aac.Data,
-			SampleRate:    aac.SampleRate,
-			Channels:      aac.Channels,
-			ChannelConfig: aac.ChannelConfig,
+			SampleRate:    sampleRate,
+			Channels:      channels,
+			ChannelConfig: channelConfig,
 			Codec:         codec,
 			TrackIndex:    trackIndex,
 		}
 
 		if d.stats != nil {
-			d.stats.RecordAudioFrame(trackIndex, int64(len(aac.Data)), framePTS, aac.SampleRate, aac.Channels, codec)
+			d.stats.RecordAudioFrame(trackIndex, int64(len(aac.Data)), framePTS, sampleRate, channels, codec)
 		}
 
 		select {

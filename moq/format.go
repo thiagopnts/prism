@@ -38,26 +38,6 @@ func stripStartCode(nalu []byte) []byte {
 	return nalu
 }
 
-// StripADTS removes the ADTS header from a complete ADTS frame, returning
-// the raw AAC payload. Returns the input unchanged if it is not a valid
-// ADTS frame.
-func StripADTS(data []byte) []byte {
-	if len(data) < 7 {
-		return data
-	}
-	if data[0] != 0xFF || (data[1]&0xF0) != 0xF0 {
-		return data
-	}
-	headerSize := 7
-	if (data[1] & 0x01) == 0 {
-		headerSize = 9
-	}
-	if len(data) <= headerSize {
-		return data
-	}
-	return data[headerSize:]
-}
-
 // BuildAVCDecoderConfig builds an AVCDecoderConfigurationRecord
 // (ISO 14496-15 §5.2.4.1.1) from raw SPS and PPS NAL data (without
 // start codes). The SPS must include the NAL header byte (0x67).

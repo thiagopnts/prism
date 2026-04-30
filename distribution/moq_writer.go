@@ -36,7 +36,9 @@ const (
 //   - Subgroup headers with QUIC varint fields
 //   - Object headers with LOC extensions (capture timestamp, video frame marking, video config)
 //   - AVC1 video payloads (length-prefixed NALUs)
-//   - Raw AAC audio payloads (ADTS headers stripped)
+//   - ADTS-framed AAC audio payloads (per WebCodecs AAC registration: when
+//     AudioDecoder.configure is called without a description, the decoder
+//     expects ADTS framing; this also lets it detect SBR signaling for HE-AAC)
 type moqWriter struct {
 	trackAlias        uint64
 	publisherPriority byte
@@ -106,13 +108,11 @@ func (m *moqWriter) WriteVideoFrame(w io.Writer, frame *media.VideoFrame) (int64
 }
 
 func (m *moqWriter) WriteAudioFrame(w io.Writer, data []byte, timestampMS uint32) (int64, error) {
-	payload := moq.StripADTS(data)
-
 	var exts []byte
 	exts = quicvarint.Append(exts, locExtCaptureTimestamp)
 	exts = quicvarint.Append(exts, uint64(timestampMS)*1000)
 
-	return m.writeObject(w, exts, payload)
+	return m.writeObject(w, exts, data)
 }
 
 func (m *moqWriter) WriteDataObject(w io.Writer, data []byte, timestampMS uint32) (int64, error) {

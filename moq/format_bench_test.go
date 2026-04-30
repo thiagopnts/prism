@@ -14,11 +14,3 @@ func BenchmarkAnnexBToAVC1(b *testing.B) {
 	}
 }
 
-func BenchmarkStripADTS(b *testing.B) {
-	// 7-byte ADTS header + payload
-	data := []byte{0xFF, 0xF1, 0x50, 0x80, 0x02, 0x00, 0xFC, 0xDE, 0xAD, 0xBE, 0xEF}
-
-	for b.Loop() {
-		StripADTS(data)
-	}
-}

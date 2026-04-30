@@ -94,50 +94,6 @@ func TestAnnexBToAVC1NoStartCode(t *testing.T) {
 	}
 }
 
-func TestStripADTS7Byte(t *testing.T) {
-	t.Parallel()
-	// 7-byte ADTS header (protection absent = 1, no CRC)
-	header := []byte{0xFF, 0xF1, 0x50, 0x80, 0x02, 0x00, 0xFC}
-	payload := []byte{0xDE, 0xAD, 0xBE, 0xEF}
-	adts := append(header, payload...)
-
-	result := StripADTS(adts)
-	if !bytes.Equal(result, payload) {
-		t.Errorf("expected payload only, got %x", result)
-	}
-}
-
-func TestStripADTS9Byte(t *testing.T) {
-	t.Parallel()
-	// 9-byte ADTS header (protection absent = 0, CRC present)
-	header := []byte{0xFF, 0xF0, 0x50, 0x80, 0x02, 0x00, 0xFC, 0xAA, 0xBB}
-	payload := []byte{0xDE, 0xAD}
-	adts := append(header, payload...)
-
-	result := StripADTS(adts)
-	if !bytes.Equal(result, payload) {
-		t.Errorf("expected payload only, got %x", result)
-	}
-}
-
-func TestStripADTSNotADTS(t *testing.T) {
-	t.Parallel()
-	data := []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
-	result := StripADTS(data)
-	if !bytes.Equal(result, data) {
-		t.Error("non-ADTS data should be returned unchanged")
-	}
-}
-
-func TestStripADTSTooShort(t *testing.T) {
-	t.Parallel()
-	data := []byte{0xFF, 0xF1}
-	result := StripADTS(data)
-	if !bytes.Equal(result, data) {
-		t.Error("too-short data should be returned unchanged")
-	}
-}
-
 func TestBuildAVCDecoderConfig(t *testing.T) {
 	t.Parallel()
 	// SPS with NAL header byte 0x67 (type 7)

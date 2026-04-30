@@ -2,6 +2,8 @@ package demux
 
 import (
 	"testing"
+
+	"github.com/zsiec/prism/mpegts"
 )
 
 // buildADTSHeader writes a 7-byte ADTS header (no CRC) into hdr describing a
@@ -204,6 +206,140 @@ func TestParseADTSBadSampleRateRecoverable(t *testing.T) {
 	if frames[0].SampleRate != 48000 {
 		t.Errorf("SampleRate = %d, want 48000", frames[0].SampleRate)
 	}
+}
+
+func TestAACCodecString(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		aot  uint8
+		want string
+	}{
+		{1, "mp4a.40.1"},
+		{2, "mp4a.40.2"},
+		{3, "mp4a.40.3"},
+		{4, "mp4a.40.4"},
+		{5, "mp4a.40.5"},
+		{29, "mp4a.40.29"},
+		{0, ""},
+		{6, ""},
+		{30, ""},
+	}
+	for _, tc := range cases {
+		if got := AACCodecString(tc.aot); got != tc.want {
+			t.Errorf("AACCodecString(%d) = %q, want %q", tc.aot, got, tc.want)
+		}
+	}
+}
+
+func TestAOTFromAudioProfileLevel(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		apli uint8
+		want uint8
+		name string
+	}{
+		{0x28, 2, "AAC L1"},
+		{0x29, 2, "AAC L2"},
+		{0x2A, 2, "AAC L4"},
+		{0x2B, 2, "AAC L5"},
+		{0x2C, 5, "HE-AAC L2"},
+		{0x2D, 5, "HE-AAC L3"},
+		{0x2E, 5, "HE-AAC L4"},
+		{0x2F, 5, "HE-AAC L5"},
+		{0x34, 5, "HE-AAC L6"},
+		{0x35, 5, "HE-AAC L7"},
+		{0x30, 29, "HE-AAC v2 L2"},
+		{0x31, 29, "HE-AAC v2 L3"},
+		{0x32, 29, "HE-AAC v2 L4"},
+		{0x33, 29, "HE-AAC v2 L5"},
+		{0x36, 29, "HE-AAC v2 L6"},
+		{0x37, 29, "HE-AAC v2 L7"},
+		{0x00, 0, "reserved 0"},
+		{0x27, 0, "below AAC range"},
+		{0x38, 0, "above HE-AAC v2 range"},
+		{0xFF, 0, "non-AAC profile"},
+	}
+	for _, tc := range cases {
+		if got := aotFromAudioProfileLevel(tc.apli); got != tc.want {
+			t.Errorf("%s: aotFromAudioProfileLevel(0x%02X) = %d, want %d",
+				tc.name, tc.apli, got, tc.want)
+		}
+	}
+}
+
+func TestAudioProfileAOTFromDescriptors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("HE-AAC descriptor present", func(t *testing.T) {
+		descs := []mpegts.PMTDescriptor{
+			{Tag: descriptorTagMPEG4Audio, Data: []byte{0x2D}}, // HE-AAC L3
+		}
+		if got := audioProfileAOTFromDescriptors(descs); got != 5 {
+			t.Errorf("got AOT=%d, want 5", got)
+		}
+	})
+
+	t.Run("HE-AAC v2 descriptor present", func(t *testing.T) {
+		descs := []mpegts.PMTDescriptor{
+			{Tag: descriptorTagMPEG4Audio, Data: []byte{0x31}}, // HE-AAC v2 L3
+		}
+		if got := audioProfileAOTFromDescriptors(descs); got != 29 {
+			t.Errorf("got AOT=%d, want 29", got)
+		}
+	})
+
+	t.Run("LC profile is reported as AOT 2", func(t *testing.T) {
+		descs := []mpegts.PMTDescriptor{
+			{Tag: descriptorTagMPEG4Audio, Data: []byte{0x29}}, // AAC L2
+		}
+		if got := audioProfileAOTFromDescriptors(descs); got != 2 {
+			t.Errorf("got AOT=%d, want 2", got)
+		}
+	})
+
+	t.Run("no descriptor", func(t *testing.T) {
+		if got := audioProfileAOTFromDescriptors(nil); got != 0 {
+			t.Errorf("got AOT=%d, want 0", got)
+		}
+	})
+
+	t.Run("unrelated descriptor only", func(t *testing.T) {
+		descs := []mpegts.PMTDescriptor{
+			{Tag: 0x05, Data: []byte{0x01, 0x02}}, // registration descriptor
+		}
+		if got := audioProfileAOTFromDescriptors(descs); got != 0 {
+			t.Errorf("got AOT=%d, want 0", got)
+		}
+	})
+
+	t.Run("MPEG-4 audio descriptor with empty data", func(t *testing.T) {
+		descs := []mpegts.PMTDescriptor{
+			{Tag: descriptorTagMPEG4Audio, Data: nil},
+		}
+		if got := audioProfileAOTFromDescriptors(descs); got != 0 {
+			t.Errorf("got AOT=%d, want 0", got)
+		}
+	})
+
+	t.Run("MPEG-4 audio descriptor among others picks AAC family", func(t *testing.T) {
+		descs := []mpegts.PMTDescriptor{
+			{Tag: 0x05, Data: []byte{'A', 'C', '-', '3'}},
+			{Tag: descriptorTagMPEG4Audio, Data: []byte{0x2C}}, // HE-AAC L2
+			{Tag: 0x52, Data: []byte{0x01}},
+		}
+		if got := audioProfileAOTFromDescriptors(descs); got != 5 {
+			t.Errorf("got AOT=%d, want 5", got)
+		}
+	})
+
+	t.Run("descriptor with non-AAC profile value", func(t *testing.T) {
+		descs := []mpegts.PMTDescriptor{
+			{Tag: descriptorTagMPEG4Audio, Data: []byte{0xFF}},
+		}
+		if got := audioProfileAOTFromDescriptors(descs); got != 0 {
+			t.Errorf("got AOT=%d, want 0", got)
+		}
+	})
 }
 
 func TestParseADTSCRCProtected(t *testing.T) {
