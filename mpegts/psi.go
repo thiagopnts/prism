@@ -155,12 +155,33 @@ func parsePMTSection(data []byte) (*PMTData, error) {
 		elementaryPID := uint16(data[offset+1]&0x1F)<<8 | uint16(data[offset+2])
 		esInfoLength := int(data[offset+3]&0x0F)<<8 | int(data[offset+4])
 
+		esInfoEnd := offset + 5 + esInfoLength
+		if esInfoEnd > sectionEnd-4 {
+			esInfoEnd = sectionEnd - 4
+		}
+
+		var descs []PMTDescriptor
+		descOff := offset + 5
+		for descOff+2 <= esInfoEnd {
+			tag := data[descOff]
+			descLen := int(data[descOff+1])
+			if descOff+2+descLen > esInfoEnd {
+				break
+			}
+			descs = append(descs, PMTDescriptor{
+				Tag:  tag,
+				Data: append([]byte(nil), data[descOff+2:descOff+2+descLen]...),
+			})
+			descOff += 2 + descLen
+		}
+
 		pmt.ElementaryStreams = append(pmt.ElementaryStreams, &PMTElementaryStream{
 			ElementaryPID: elementaryPID,
 			StreamType:    streamType,
+			Descriptors:   descs,
 		})
 
-		offset += 5 + esInfoLength
+		offset = esInfoEnd
 	}
 
 	return pmt, nil

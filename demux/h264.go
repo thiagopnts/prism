@@ -38,8 +38,8 @@ func (s SPSInfo) CodecString() string {
 	return fmt.Sprintf("avc1.%02X%02X%02X", s.ProfileIDC, s.ConstraintFlags, s.LevelIDC)
 }
 
-// Timecode represents a SMPTE 12M timecode extracted from an H.264 pic_timing
-// SEI message.
+// Timecode represents a SMPTE 12M timecode extracted from a video stream SEI
+// message (H.264 pic_timing or HEVC time_code).
 type Timecode struct {
 	Hours   int
 	Minutes int
@@ -533,6 +533,8 @@ func IsPPS(nalType byte) bool {
 	return nalType == NALTypePPS
 }
 
+const SEI_PAYLOAD_TYPE_PIC_TIMING = 1
+
 // ParsePicTimingSEI extracts a SMPTE 12M timecode from an H.264 pic_timing
 // SEI message. Returns the timecode and true if extraction succeeded, or a
 // zero value and false if the SEI doesn't contain valid clock timestamps.
@@ -541,60 +543,25 @@ func ParsePicTimingSEI(seiNALU []byte, sps SPSInfo) (Timecode, bool) {
 	if len(seiNALU) < 2 {
 		return Timecode{}, false
 	}
-	if !sps.PicStructPresent || !sps.HRDPresent {
+	if !sps.PicStructPresent {
 		return Timecode{}, false
 	}
 
 	rbsp := removeEmulationPrevention(seiNALU[1:])
-	i := 0
-	for i < len(rbsp) {
-		if rbsp[i] == 0x80 {
-			break
-		}
-
-		payloadType := 0
-		for i < len(rbsp) && rbsp[i] == 0xFF {
-			payloadType += 255
-			i++
-		}
-		if i >= len(rbsp) {
-			break
-		}
-		payloadType += int(rbsp[i])
-		i++
-
-		payloadSize := 0
-		for i < len(rbsp) && rbsp[i] == 0xFF {
-			payloadSize += 255
-			i++
-		}
-		if i >= len(rbsp) {
-			break
-		}
-		payloadSize += int(rbsp[i])
-		i++
-
-		if i+payloadSize > len(rbsp) {
-			break
-		}
-
-		if payloadType == 1 {
-			tc, ok := parsePicTimingPayload(rbsp[i:i+payloadSize], sps)
-			if ok {
-				return tc, true
-			}
-		}
-		i += payloadSize
+	payload := findSEIPayload(rbsp, SEI_PAYLOAD_TYPE_PIC_TIMING)
+	if payload == nil {
+		return Timecode{}, false
 	}
-
-	return Timecode{}, false
+	return parsePicTimingPayload(payload, sps)
 }
 
 func parsePicTimingPayload(payload []byte, sps SPSInfo) (Timecode, bool) {
 	br := newBitReader(payload)
 
-	br.readBits(sps.CpbRemovalDelayLen)
-	br.readBits(sps.DpbOutputDelayLen)
+	if sps.HRDPresent {
+		br.readBits(sps.CpbRemovalDelayLen)
+		br.readBits(sps.DpbOutputDelayLen)
+	}
 
 	picStruct, err := br.readBits(4)
 	if err != nil {

@@ -224,3 +224,71 @@ func TestIsHEVCVPSSPSPPS(t *testing.T) {
 		t.Error("IsHEVCPPS should return false for VPS")
 	}
 }
+
+func TestParseHEVCTimeCodeSEI(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		nal  []byte
+		want Timecode
+		ok   bool
+	}{
+		{
+			name: "TC 01:02:03:04 full timestamp",
+			// HEVC NAL header (SEI prefix) + payload type 136 + size 6 + TIME_CODE payload + stop
+			nal: []byte{
+				0x4E, 0x01, // NAL header (type 39 = SEI prefix)
+				0x88,                               // payload type = 136
+				0x06,                               // payload size = 6
+				0x60, 0x40, 0x20, 0x61, 0x04, 0x00, // TIME_CODE: num_clock_ts=1, full_ts, frames=4, secs=3, mins=2, hrs=1
+				0x80, // stop bit
+			},
+			want: Timecode{Hours: 1, Minutes: 2, Seconds: 3, Frames: 4},
+			ok:   true,
+		},
+		{
+			name: "non-timecode SEI",
+			nal: []byte{
+				0x4E, 0x01, // NAL header
+				0x05,       // payload type = 5 (user data)
+				0x02,       // payload size = 2
+				0xAA, 0xBB, // data
+				0x80,
+			},
+			want: Timecode{},
+			ok:   false,
+		},
+		{
+			name: "too short",
+			nal:  []byte{0x4E, 0x01},
+			want: Timecode{},
+			ok:   false,
+		},
+		{
+			name: "num_clock_ts zero",
+			nal: []byte{
+				0x4E, 0x01,
+				0x88, // payload type = 136
+				0x01, // payload size = 1
+				0x00, // num_clock_ts = 0
+				0x80,
+			},
+			want: Timecode{},
+			ok:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := ParseHEVCTimeCodeSEI(tt.nal)
+			if ok != tt.ok {
+				t.Fatalf("ok: got %v, want %v", ok, tt.ok)
+			}
+			if ok && got != tt.want {
+				t.Errorf("timecode: got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
