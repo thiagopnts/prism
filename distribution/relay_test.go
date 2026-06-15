@@ -218,6 +218,65 @@ func TestRelayGOPResetOnKeyframe(t *testing.T) {
 	}
 }
 
+// TestRelayGOPCacheBoundedWithoutKeyframe guards against the unbounded-growth
+// OOM: a feed that never sends a keyframe (e.g. scene-cut-only IDR) must not
+// grow the GOP cache without limit. The cache must stay within ~6 seconds.
+func TestRelayGOPCacheBoundedWithoutKeyframe(t *testing.T) {
+	t.Parallel()
+
+	r := NewRelay()
+
+	// 10 seconds of 30fps delta frames, no keyframe (PTS is in microseconds).
+	const usPerFrame = 1_000_000 / 30
+	for i := 0; i < 300; i++ {
+		r.BroadcastVideo(&media.VideoFrame{
+			PTS:   int64(i) * usPerFrame,
+			NALUs: [][]byte{{0x41}},
+		})
+	}
+
+	r.gopMu.RLock()
+	n := len(r.gopCache)
+	span := r.gopCache[n-1].PTS - r.gopCache[0].PTS
+	r.gopMu.RUnlock()
+
+	if span > gopCacheMaxDurationUS {
+		t.Errorf("GOP cache spans %dus, want <= %dus", span, gopCacheMaxDurationUS)
+	}
+	if n > gopCacheMaxFrames {
+		t.Errorf("GOP cache holds %d frames, want <= %d", n, gopCacheMaxFrames)
+	}
+	// ~6s at 30fps ≈ 180 frames; allow a small slack for the boundary frame.
+	if n < 175 || n > 185 {
+		t.Errorf("GOP cache holds %d frames, want ~180 (6s @ 30fps)", n)
+	}
+}
+
+// TestRelayGOPCacheFrameCountBackstop covers a feed with broken / frozen PTS
+// (so the duration bound never trips): the absolute frame-count backstop must
+// still cap the cache.
+func TestRelayGOPCacheFrameCountBackstop(t *testing.T) {
+	t.Parallel()
+
+	r := NewRelay()
+
+	// Constant PTS => span is always 0, so only the frame-count backstop applies.
+	for i := 0; i < 2*gopCacheMaxFrames; i++ {
+		r.BroadcastVideo(&media.VideoFrame{
+			PTS:   1000,
+			NALUs: [][]byte{{0x41}},
+		})
+	}
+
+	r.gopMu.RLock()
+	n := len(r.gopCache)
+	r.gopMu.RUnlock()
+
+	if n != gopCacheMaxFrames {
+		t.Errorf("GOP cache holds %d frames, want %d (backstop)", n, gopCacheMaxFrames)
+	}
+}
+
 func TestRelayWaitVideoInfo(t *testing.T) {
 	t.Parallel()
 

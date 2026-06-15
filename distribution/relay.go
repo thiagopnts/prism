@@ -42,6 +42,20 @@ type AudioInfo struct {
 // for replay to late-joining subscribers (~1 second at ~23ms/frame for AAC).
 const audioCacheSize = 50
 
+// gopCacheMaxDurationUS bounds the GOP cache to ~6 seconds of video
+// (media.VideoFrame.PTS is in microseconds). For well-behaved feeds the
+// keyframe reset in BroadcastVideo already keeps the cache to a single GOP, so
+// this never triggers; it only engages for pathological long-GOP / IDR-less
+// feeds (e.g. scene-cut-only IDR) where IsKeyframe rarely or never fires.
+// Without it the cache grows append-only for the whole session and exhausts
+// memory (frames pin their NALU + WireData byte slices).
+const gopCacheMaxDurationUS = 6 * 1_000_000
+
+// gopCacheMaxFrames is an absolute backstop, independent of timestamps, so a
+// stream with broken / wrapping / discontinuous PTS still can't grow the cache
+// without bound. Well above one GOP at any sane frame rate.
+const gopCacheMaxFrames = 1024
+
 // Relay is the fan-out hub for a single stream. It distributes video, audio,
 // and caption frames from the pipeline to all connected MoQ viewers. It also
 // caches the current GOP so that late-joining viewers can start playback
@@ -200,9 +214,10 @@ func (r *Relay) BroadcastVideo(frame *media.VideoFrame) {
 
 	r.gopMu.Lock()
 	if frame.IsKeyframe {
-		r.gopCache = r.gopCache[:0]
+		r.truncateGOPCacheLocked(0) // start a fresh GOP
 	}
 	r.gopCache = append(r.gopCache, frame)
+	r.trimGOPCacheLocked()
 	r.gopMu.Unlock()
 
 	r.mu.RLock()
@@ -211,6 +226,41 @@ func (r *Relay) BroadcastVideo(frame *media.VideoFrame) {
 	for _, session := range r.sessions {
 		session.SendVideo(frame)
 	}
+}
+
+// truncateGOPCacheLocked keeps only the first n cached frames, niling the
+// dropped slots so the retained *VideoFrame (and the large NALU / WireData byte
+// slices they pin) become collectable instead of lingering in the backing array
+// up to its capacity. Caller must hold gopMu.
+func (r *Relay) truncateGOPCacheLocked(n int) {
+	for i := n; i < len(r.gopCache); i++ {
+		r.gopCache[i] = nil
+	}
+	r.gopCache = r.gopCache[:n]
+}
+
+// trimGOPCacheLocked drops the oldest frames until the cache spans at most
+// gopCacheMaxDurationUS and holds at most gopCacheMaxFrames. This bounds memory
+// for feeds whose keyframes are sparse or absent, where the keyframe reset never
+// fires. Caller must hold gopMu and must have just appended (cache is non-empty).
+func (r *Relay) trimGOPCacheLocked() {
+	newest := r.gopCache[len(r.gopCache)-1].PTS
+	drop := 0
+	for drop < len(r.gopCache)-1 {
+		overCount := len(r.gopCache)-drop > gopCacheMaxFrames
+		// A negative span (PTS wrap / discontinuity) is not "over duration";
+		// the frame-count backstop above still bounds the cache in that case.
+		overDuration := newest-r.gopCache[drop].PTS > gopCacheMaxDurationUS
+		if !overCount && !overDuration {
+			break
+		}
+		drop++
+	}
+	if drop == 0 {
+		return
+	}
+	kept := copy(r.gopCache, r.gopCache[drop:])
+	r.truncateGOPCacheLocked(kept)
 }
 
 // BroadcastVideoNoCache sends a video frame to all connected viewers without
