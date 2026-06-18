@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/zsiec/ccx"
 	"github.com/zsiec/prism/media"
@@ -353,26 +354,82 @@ func TestRelayViewerStatsAll(t *testing.T) {
 	}
 }
 
-func TestRelayAudioTrackCount(t *testing.T) {
+func TestRelayObservedAudioTracks(t *testing.T) {
 	t.Parallel()
 
 	r := NewRelay()
 
-	// Default should be 1
-	if r.AudioTrackCount() != 1 {
-		t.Errorf("default AudioTrackCount: got %d, want 1", r.AudioTrackCount())
+	// No audio seen yet → no observed tracks (a video-only feed advertises none).
+	if got := r.ObservedAudioTracks(); len(got) != 0 {
+		t.Fatalf("default ObservedAudioTracks: got %d, want 0", len(got))
 	}
 
-	r.SetAudioTrackCount(3)
-	if r.AudioTrackCount() != 3 {
-		t.Errorf("AudioTrackCount: got %d, want 3", r.AudioTrackCount())
+	// Broadcasting audio frames records each distinct track and its parameters.
+	r.BroadcastAudio(&media.AudioFrame{TrackIndex: 1, SampleRate: 44100, Channels: 1})
+	r.BroadcastAudio(&media.AudioFrame{TrackIndex: 0, SampleRate: 48000, Channels: 2})
+	r.BroadcastAudio(&media.AudioFrame{TrackIndex: 0, SampleRate: 48000, Channels: 2}) // dup
+
+	got := r.ObservedAudioTracks()
+	if len(got) != 2 {
+		t.Fatalf("ObservedAudioTracks: got %d tracks, want 2", len(got))
+	}
+	// Sorted by index.
+	if got[0].Index != 0 || got[1].Index != 1 {
+		t.Fatalf("track order = [%d, %d], want [0, 1]", got[0].Index, got[1].Index)
+	}
+	if got[0].Info.Codec != "mp4a.40.02" || got[0].Info.SampleRate != 48000 || got[0].Info.Channels != 2 {
+		t.Errorf("track0 params = %+v", got[0].Info)
+	}
+	if got[1].Info.SampleRate != 44100 || got[1].Info.Channels != 1 {
+		t.Errorf("track1 params = %+v", got[1].Info)
+	}
+}
+
+func TestRelayInitWindowDropsThenForwards(t *testing.T) {
+	t.Parallel()
+
+	r := NewRelay()
+	r.SetInitWindow(40 * time.Millisecond)
+
+	viewer := newMockViewer("v1")
+	r.AddViewer(viewer)
+
+	// During the window, frames are observed (audio) but dropped: nothing
+	// reaches the viewer and the GOP/audio caches stay empty.
+	r.BroadcastVideo(&media.VideoFrame{IsKeyframe: true, NALUs: [][]byte{{0x65, 0x01}}})
+	r.BroadcastAudio(&media.AudioFrame{TrackIndex: 0, SampleRate: 48000, Channels: 2})
+
+	if viewer.videoSent.Load() != 0 || viewer.audioSent.Load() != 0 {
+		t.Fatalf("frames delivered during init window: video=%d audio=%d",
+			viewer.videoSent.Load(), viewer.audioSent.Load())
+	}
+	if r.WaitCatalogReady(canceledContext()) {
+		t.Fatal("catalog should not be ready during the init window")
+	}
+	// Audio was still observed so the catalog can advertise it.
+	if got := r.ObservedAudioTracks(); len(got) != 1 {
+		t.Fatalf("observed audio during window: got %d, want 1", len(got))
 	}
 
-	// Setting to 0 should default to 1
-	r.SetAudioTrackCount(0)
-	if r.AudioTrackCount() != 1 {
-		t.Errorf("AudioTrackCount after 0: got %d, want 1", r.AudioTrackCount())
+	// After the window closes, the catalog is ready and frames forward normally.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !r.WaitCatalogReady(ctx) {
+		t.Fatal("catalog not ready after init window elapsed")
 	}
+	r.BroadcastVideo(&media.VideoFrame{IsKeyframe: true, NALUs: [][]byte{{0x65, 0x02}}})
+	r.BroadcastAudio(&media.AudioFrame{TrackIndex: 0, SampleRate: 48000, Channels: 2})
+	if viewer.videoSent.Load() != 1 || viewer.audioSent.Load() != 1 {
+		t.Fatalf("frames not forwarded after init window: video=%d audio=%d",
+			viewer.videoSent.Load(), viewer.audioSent.Load())
+	}
+}
+
+// canceledContext returns an already-cancelled context for non-blocking checks.
+func canceledContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
 }
 
 func TestRelayBroadcastVideoNoCacheDeliversFrames(t *testing.T) {
@@ -458,24 +515,6 @@ func TestRelayBroadcastVideoNoCacheMixedWithCached(t *testing.T) {
 		t.Errorf("replayed frame PTS: got %d, want 1000", v.videos[0].PTS)
 	}
 	v.mu.Unlock()
-}
-
-func TestRelayAudioInfo(t *testing.T) {
-	t.Parallel()
-
-	r := NewRelay()
-
-	// Default
-	ai := r.AudioInfo()
-	if ai.Codec != "mp4a.40.02" {
-		t.Errorf("default codec: got %q, want mp4a.40.02", ai.Codec)
-	}
-
-	r.SetAudioInfo(AudioInfo{Codec: "mp4a.40.02", SampleRate: 44100, Channels: 1})
-	ai = r.AudioInfo()
-	if ai.SampleRate != 44100 || ai.Channels != 1 {
-		t.Errorf("AudioInfo: got %d/%d, want 44100/1", ai.SampleRate, ai.Channels)
-	}
 }
 
 func TestRelayAudioCacheReplay(t *testing.T) {

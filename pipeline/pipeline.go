@@ -25,9 +25,6 @@ type Broadcaster interface {
 	BroadcastAudio(frame *media.AudioFrame)
 	BroadcastCaptions(frame *ccx.CaptionFrame)
 	SetVideoInfo(info distribution.VideoInfo)
-	SetAudioTrackCount(count int)
-	AudioTrackCount() int
-	SetAudioInfo(info distribution.AudioInfo)
 	ViewerCount() int
 	ViewerStatsAll() []distribution.ViewerStats
 }
@@ -47,7 +44,6 @@ type Pipeline struct {
 	videoForwarded  atomic.Int64
 	audioForwarded  atomic.Int64
 	videoInfoSent   bool
-	audioInfoSent   bool
 	captionFwd      atomic.Int64
 	lastVideoFwdPTS atomic.Int64
 	lastAudioFwdPTS atomic.Int64
@@ -127,17 +123,15 @@ func (p *Pipeline) Run(ctx context.Context) error {
 
 	select {
 	case <-p.demuxer.PMTReady():
-		audioTracks := p.demuxer.AudioTrackChannels()
-		p.relay.SetAudioTrackCount(len(audioTracks))
-		p.log.Info("audio tracks", "count", len(audioTracks))
+		// PMT parsed; PID-to-track mappings are established. Which audio tracks
+		// the feed actually carries is discovered by the relay as frames flow
+		// (the init window), not declared from the PMT here.
 	case err := <-demuxErr:
 		p.log.Info("demuxer finished before PMT", "error", err)
 		return nil
 	case <-ctx.Done():
 		return nil
 	}
-
-	lastTrackCount := p.relay.AudioTrackCount()
 
 	videoCh := p.demuxer.Video()
 	audioCh := p.demuxer.Audio()
@@ -176,20 +170,6 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			if !ok {
 				p.log.Info("audio channel closed")
 				return nil
-			}
-			newCount := len(p.demuxer.AudioTrackChannels())
-			if newCount > lastTrackCount {
-				p.relay.SetAudioTrackCount(newCount)
-				p.log.Info("audio tracks updated", "count", newCount)
-				lastTrackCount = newCount
-			}
-			if !p.audioInfoSent && frame.SampleRate > 0 {
-				p.relay.SetAudioInfo(distribution.AudioInfo{
-					Codec:      "mp4a.40.02",
-					SampleRate: frame.SampleRate,
-					Channels:   frame.Channels,
-				})
-				p.audioInfoSent = true
 			}
 			p.relay.BroadcastAudio(frame)
 			p.audioForwarded.Add(1)

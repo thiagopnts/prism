@@ -138,6 +138,12 @@ type ServerConfig struct {
 	ExternalCert bool // true when using a CA-signed cert (not self-signed)
 	ExtraRoutes  func(mux *http.ServeMux)
 
+	// InitWindow is how long a new stream's relay observes the incoming feed to
+	// learn which tracks it carries before freezing the catalog. Frames received
+	// during the window are dropped (not forwarded) so playback runs at the live
+	// edge with no buffering latency. If zero, defaultInitWindow (1s) is used.
+	InitWindow time.Duration
+
 	// OnStreamRegistered is called after a new stream relay is created
 	// and added to the server's stream map. It is NOT called when
 	// RegisterStream returns an existing relay for a duplicate key.
@@ -239,6 +245,11 @@ func (s *Server) RegisterStream(streamKey string) *Relay {
 		return sr.relay
 	}
 	r := NewRelay()
+	window := s.config.InitWindow
+	if window <= 0 {
+		window = defaultInitWindow
+	}
+	r.SetInitWindow(window)
 	s.streams[streamKey] = &streamResources{relay: r}
 	s.mu.Unlock()
 
@@ -434,6 +445,9 @@ func (s *Server) handleMoQ(w http.ResponseWriter, r *http.Request) {
 	waitCtx, waitCancel := context.WithTimeout(r.Context(), videoInfoTimeout)
 	defer waitCancel()
 	relay.WaitVideoInfo(waitCtx)
+	// Wait for the init window to close so the catalog reflects the feed's full
+	// track set before this viewer can subscribe to it.
+	relay.WaitCatalogReady(waitCtx)
 
 	relay.AddViewer(moqSession)
 	defer relay.RemoveViewer(moqSession.ID())

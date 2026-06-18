@@ -3,7 +3,10 @@ package distribution
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/zsiec/ccx"
 	"github.com/zsiec/prism/media"
@@ -56,37 +59,64 @@ const gopCacheMaxDurationUS = 6 * 1_000_000
 // without bound. Well above one GOP at any sane frame rate.
 const gopCacheMaxFrames = 1024
 
+// defaultInitWindow is how long the relay observes an incoming feed to learn
+// which tracks it carries before freezing the catalog. Frames received during
+// the window are dropped (not cached or forwarded) so steady-state playback runs
+// at the live edge with no added buffering latency. The window is opted into by
+// the server (see ServerConfig.InitWindow); a Relay constructed directly has no
+// init window and forwards immediately.
+const defaultInitWindow = 1 * time.Second
+
+// audioCodecAAC is the MoQ codec string for AAC-LC, the only audio codec the
+// demuxer produces. Audio frames carry sample rate and channel count but not a
+// codec string, so the catalog reports this constant for every audio track.
+const audioCodecAAC = "mp4a.40.02"
+
 // Relay is the fan-out hub for a single stream. It distributes video, audio,
 // and caption frames from the pipeline to all connected MoQ viewers. It also
 // caches the current GOP so that late-joining viewers can start playback
 // immediately from the most recent keyframe, and recent audio frames so that
 // new audio subscribers can pre-fill their buffers.
 type Relay struct {
-	log             *slog.Logger
-	mu              sync.RWMutex
-	sessions        map[string]Viewer
-	audioTrackCount int
-	videoInfo       VideoInfo
-	videoInfoSet    bool
-	videoInfoReady  chan struct{}
-	audioInfo       AudioInfo
-	audioInfoSet    bool
+	log            *slog.Logger
+	mu             sync.RWMutex
+	sessions       map[string]Viewer
+	videoInfo      VideoInfo
+	videoInfoSet   bool
+	videoInfoReady chan struct{}
+
+	// Init window: observe which tracks the feed carries before freezing the
+	// catalog. A Relay built directly has windowEnabled=false and
+	// catalogFrozen=true, so it forwards immediately with no window; the server
+	// opts into the window via SetInitWindow.
+	initWindow    time.Duration
+	windowEnabled atomic.Bool
+	catalogFrozen atomic.Bool
+	initOnce      sync.Once
+	catalogReady  chan struct{}
 
 	gopMu    sync.RWMutex
 	gopCache []*media.VideoFrame
 
-	audioMu    sync.RWMutex
-	audioCache map[int][]*media.AudioFrame
+	audioMu       sync.RWMutex
+	audioCache    map[int][]*media.AudioFrame
+	observedAudio map[int]AudioInfo // audio tracks seen in the feed; guarded by audioMu
 }
 
 // NewRelay creates a Relay with no viewers.
 func NewRelay() *Relay {
-	return &Relay{
+	r := &Relay{
 		log:            slog.With("component", "relay"),
 		sessions:       make(map[string]Viewer),
 		videoInfoReady: make(chan struct{}),
+		catalogReady:   make(chan struct{}),
 		audioCache:     make(map[int][]*media.AudioFrame),
+		observedAudio:  make(map[int]AudioInfo),
 	}
+	// No init window by default: forward immediately and treat the catalog as
+	// ready. The server opts into the window via SetInitWindow.
+	r.catalogFrozen.Store(true)
+	return r
 }
 
 // SetVideoInfo stores the video codec parameters detected from the first
@@ -106,51 +136,93 @@ func (r *Relay) SetVideoInfo(info VideoInfo) {
 	}
 }
 
-// SetAudioTrackCount sets the number of audio tracks discovered by the demuxer,
-// used to advertise available tracks during viewer connection setup.
-func (r *Relay) SetAudioTrackCount(count int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.audioTrackCount = count
-	if count == 0 {
-		r.audioTrackCount = 1
+// SetInitWindow configures the init-window duration: the period after the first
+// frame during which the relay observes the feed's track set (dropping frames)
+// before freezing the catalog and forwarding live content. A non-positive
+// duration disables the window — the relay forwards immediately and records
+// tracks as they appear. Must be called before the first frame is broadcast.
+func (r *Relay) SetInitWindow(d time.Duration) {
+	if d <= 0 {
+		r.windowEnabled.Store(false)
+		r.catalogFrozen.Store(true)
+		return
+	}
+	r.initWindow = d
+	r.windowEnabled.Store(true)
+	r.catalogFrozen.Store(false)
+}
+
+// startInitWindow schedules the catalog freeze exactly once, triggered by the
+// first frame observed while the window is open.
+func (r *Relay) startInitWindow() {
+	r.initOnce.Do(func() {
+		window := r.initWindow
+		if window <= 0 {
+			window = defaultInitWindow
+		}
+		time.AfterFunc(window, r.freezeCatalog)
+	})
+}
+
+// freezeCatalog locks the observed track set and unblocks catalog subscribers.
+// After this fires, frames forward normally instead of being dropped.
+func (r *Relay) freezeCatalog() {
+	if r.catalogFrozen.CompareAndSwap(false, true) {
+		close(r.catalogReady)
+		r.audioMu.RLock()
+		n := len(r.observedAudio)
+		r.audioMu.RUnlock()
+		r.log.Debug("init window closed, catalog frozen", "audioTracks", n)
 	}
 }
 
-// AudioTrackCount returns the number of audio tracks, defaulting to 1.
-func (r *Relay) AudioTrackCount() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.audioTrackCount == 0 {
-		return 1
+// observeAudio records an audio track (and its parameters) the first time it is
+// seen, so the catalog reflects what the feed actually carries.
+func (r *Relay) observeAudio(frame *media.AudioFrame) {
+	r.audioMu.Lock()
+	if _, ok := r.observedAudio[frame.TrackIndex]; !ok {
+		r.observedAudio[frame.TrackIndex] = AudioInfo{
+			Codec:      audioCodecAAC,
+			SampleRate: frame.SampleRate,
+			Channels:   frame.Channels,
+		}
 	}
-	return r.audioTrackCount
+	r.audioMu.Unlock()
 }
 
-// SetAudioInfo stores the audio codec parameters detected from the first
-// audio frame. Called by the pipeline once ADTS header parsing succeeds.
-func (r *Relay) SetAudioInfo(info AudioInfo) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.audioInfoSet {
-		r.audioInfo = info
-		r.audioInfoSet = true
-		r.log.Debug("audio info set",
-			"codec", info.Codec,
-			"sampleRate", info.SampleRate,
-			"channels", info.Channels)
-	}
+// ObservedAudioTrack pairs an audio track index with the parameters observed
+// for it in the feed.
+type ObservedAudioTrack struct {
+	Index int
+	Info  AudioInfo
 }
 
-// AudioInfo returns the detected audio codec parameters, or sensible
-// defaults if no audio frame has been seen yet.
-func (r *Relay) AudioInfo() AudioInfo {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.audioInfoSet {
-		return r.audioInfo
+// ObservedAudioTracks returns the audio tracks observed in the feed, sorted by
+// track index. It is empty for a feed that carried no audio (e.g. video-only).
+func (r *Relay) ObservedAudioTracks() []ObservedAudioTrack {
+	r.audioMu.RLock()
+	defer r.audioMu.RUnlock()
+	tracks := make([]ObservedAudioTrack, 0, len(r.observedAudio))
+	for idx, info := range r.observedAudio {
+		tracks = append(tracks, ObservedAudioTrack{Index: idx, Info: info})
 	}
-	return AudioInfo{Codec: "mp4a.40.02", SampleRate: 48000, Channels: 2}
+	sort.Slice(tracks, func(i, j int) bool { return tracks[i].Index < tracks[j].Index })
+	return tracks
+}
+
+// WaitCatalogReady blocks until the init window has elapsed and the catalog's
+// track set is frozen, or until ctx is cancelled. Returns true if the catalog
+// is ready. A relay with no init window is ready immediately.
+func (r *Relay) WaitCatalogReady(ctx context.Context) bool {
+	if r.catalogFrozen.Load() {
+		return true
+	}
+	select {
+	case <-r.catalogReady:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // AddViewer replays the cached GOP to the viewer, then registers it for
@@ -207,6 +279,11 @@ func (r *Relay) WaitVideoInfo(ctx context.Context) bool {
 // BroadcastVideo sends a video frame to all connected viewers and updates
 // the GOP cache. Codec detection is handled by the pipeline via SetVideoInfo.
 func (r *Relay) BroadcastVideo(frame *media.VideoFrame) {
+	if r.windowEnabled.Load() && !r.catalogFrozen.Load() {
+		r.startInitWindow()
+		return // drop during the init window
+	}
+
 	// Pre-compute AVC1 (length-prefixed) wire data once so all viewers share the same bytes.
 	if frame.WireData == nil {
 		frame.WireData = moq.AnnexBToAVC1(frame.NALUs)
@@ -274,6 +351,11 @@ func (r *Relay) trimGOPCacheLocked() {
 // Late-joining viewers on a no-cache relay will not receive a GOP replay;
 // they simply wait for the next frame (~33ms at 30fps).
 func (r *Relay) BroadcastVideoNoCache(frame *media.VideoFrame) {
+	if r.windowEnabled.Load() && !r.catalogFrozen.Load() {
+		r.startInitWindow()
+		return // drop during the init window
+	}
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -315,6 +397,18 @@ func (r *Relay) ReplayFullGOPToChannel(ch chan<- *media.VideoFrame) int {
 // BroadcastAudio sends an audio frame to all connected viewers and updates
 // the per-track audio cache for late-joining subscriber replay.
 func (r *Relay) BroadcastAudio(frame *media.AudioFrame) {
+	if r.windowEnabled.Load() {
+		if !r.catalogFrozen.Load() {
+			r.startInitWindow()
+			r.observeAudio(frame)
+			return // drop during the init window
+		}
+	} else {
+		// No init window: record tracks as they appear so the catalog reflects
+		// what the feed carries.
+		r.observeAudio(frame)
+	}
+
 	r.audioMu.Lock()
 	cache := r.audioCache[frame.TrackIndex]
 	if len(cache) >= audioCacheSize {
@@ -357,6 +451,11 @@ func (r *Relay) ReplayAudioToChannel(trackIndex int, ch chan<- *media.AudioFrame
 
 // BroadcastCaptions sends a caption frame to all connected viewers.
 func (r *Relay) BroadcastCaptions(frame *ccx.CaptionFrame) {
+	if r.windowEnabled.Load() && !r.catalogFrozen.Load() {
+		r.startInitWindow()
+		return // drop during the init window
+	}
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 

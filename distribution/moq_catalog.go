@@ -46,7 +46,6 @@ type moqSelectionParams struct {
 // for application-level state broadcast (e.g., switcher control room state).
 func buildMoQCatalog(streamKey string, relay *Relay, controlEnabled bool) ([]byte, error) {
 	vi := relay.VideoInfo()
-	ai := relay.AudioInfo()
 
 	catalog := moqCatalog{
 		Version:                1,
@@ -72,14 +71,15 @@ func buildMoQCatalog(streamKey string, relay *Relay, controlEnabled bool) ([]byt
 		SelectionParams: videoParams,
 	})
 
-	// Audio tracks
-	for i := 0; i < relay.AudioTrackCount(); i++ {
+	// Audio tracks — only those observed in the feed during the init window.
+	// A feed with no audio advertises no audio track.
+	for _, t := range relay.ObservedAudioTracks() {
 		catalog.Tracks = append(catalog.Tracks, moqCatalogTrack{
-			Name: fmt.Sprintf("audio%d", i),
+			Name: fmt.Sprintf("audio%d", t.Index),
 			SelectionParams: moqSelectionParams{
-				Codec:         ai.Codec,
-				SampleRate:    ai.SampleRate,
-				ChannelConfig: fmt.Sprintf("%d", ai.Channels),
+				Codec:         t.Info.Codec,
+				SampleRate:    t.Info.SampleRate,
+				ChannelConfig: fmt.Sprintf("%d", t.Info.Channels),
 			},
 		})
 	}

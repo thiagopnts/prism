@@ -2,12 +2,17 @@ package distribution
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+
+	"github.com/zsiec/prism/media"
 )
 
 func TestBuildMoQCatalogBasic(t *testing.T) {
 	t.Parallel()
 	relay := NewRelay()
+	// Feed with one audio track: observed from a broadcast audio frame.
+	relay.BroadcastAudio(&media.AudioFrame{TrackIndex: 0, SampleRate: 48000, Channels: 2})
 	data, err := buildMoQCatalog("teststream", relay, false)
 	if err != nil {
 		t.Fatal(err)
@@ -34,7 +39,7 @@ func TestBuildMoQCatalogBasic(t *testing.T) {
 		t.Fatalf("packaging = %q", cat.CommonTrackFields.Packaging)
 	}
 
-	// Default relay: 1 audio track → video + audio0 + captions + stats = 4 tracks
+	// One audio track → video + audio0 + captions + stats = 4 tracks
 	if len(cat.Tracks) != 4 {
 		t.Fatalf("track count = %d, want 4", len(cat.Tracks))
 	}
@@ -78,10 +83,49 @@ func TestBuildMoQCatalogBasic(t *testing.T) {
 	}
 }
 
+func TestBuildMoQCatalogNoAudio(t *testing.T) {
+	t.Parallel()
+	// A video-only feed never sets an audio track count (it stays zero); the
+	// catalog must not advertise a phantom audio track.
+	relay := NewRelay()
+
+	data, err := buildMoQCatalog("video-only", relay, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var cat moqCatalog
+	if err := json.Unmarshal(data, &cat); err != nil {
+		t.Fatal(err)
+	}
+
+	// video + captions + stats = 3 tracks, no audio.
+	if len(cat.Tracks) != 3 {
+		t.Fatalf("track count = %d, want 3", len(cat.Tracks))
+	}
+	for _, tr := range cat.Tracks {
+		if strings.HasPrefix(tr.Name, "audio") {
+			t.Fatalf("unexpected audio track %q in video-only catalog", tr.Name)
+		}
+	}
+	if cat.Tracks[0].Name != "video" {
+		t.Fatalf("tracks[0].name = %q, want video", cat.Tracks[0].Name)
+	}
+	if cat.Tracks[1].Name != "captions" {
+		t.Fatalf("tracks[1].name = %q, want captions", cat.Tracks[1].Name)
+	}
+	if cat.Tracks[2].Name != "stats" {
+		t.Fatalf("tracks[2].name = %q, want stats", cat.Tracks[2].Name)
+	}
+}
+
 func TestBuildMoQCatalogMultiAudio(t *testing.T) {
 	t.Parallel()
 	relay := NewRelay()
-	relay.SetAudioTrackCount(3)
+	// Three audio tracks observed from broadcast frames.
+	for i := 0; i < 3; i++ {
+		relay.BroadcastAudio(&media.AudioFrame{TrackIndex: i, SampleRate: 48000, Channels: 2})
+	}
 
 	data, err := buildMoQCatalog("multi", relay, false)
 	if err != nil {
@@ -163,10 +207,12 @@ func TestBuildMoQCatalogJSONFieldNames(t *testing.T) {
 	}
 }
 
-func TestBuildMoQCatalogCustomAudioInfo(t *testing.T) {
+func TestBuildMoQCatalogObservedAudioParams(t *testing.T) {
 	t.Parallel()
 	relay := NewRelay()
-	relay.SetAudioInfo(AudioInfo{Codec: "mp4a.40.05", SampleRate: 44100, Channels: 1})
+	// Audio params are taken from the observed frame (sample rate / channels);
+	// the codec is always AAC-LC, the only codec the demuxer produces.
+	relay.BroadcastAudio(&media.AudioFrame{TrackIndex: 0, SampleRate: 44100, Channels: 1})
 
 	data, err := buildMoQCatalog("custom-audio", relay, false)
 	if err != nil {
@@ -179,7 +225,7 @@ func TestBuildMoQCatalogCustomAudioInfo(t *testing.T) {
 	}
 
 	ap := cat.Tracks[1].SelectionParams
-	if ap.Codec != "mp4a.40.05" {
+	if ap.Codec != "mp4a.40.02" {
 		t.Fatalf("audio codec = %q", ap.Codec)
 	}
 	if ap.SampleRate != 44100 {
@@ -194,7 +240,8 @@ func TestBuildMoQCatalogControlTrack(t *testing.T) {
 	t.Parallel()
 	relay := NewRelay()
 
-	// Without control enabled: 4 tracks (video + audio0 + captions + stats)
+	// Video-only default relay. Without control enabled: 3 tracks
+	// (video + captions + stats)
 	dataNoControl, err := buildMoQCatalog("test", relay, false)
 	if err != nil {
 		t.Fatal(err)
@@ -203,11 +250,11 @@ func TestBuildMoQCatalogControlTrack(t *testing.T) {
 	if err := json.Unmarshal(dataNoControl, &catNoControl); err != nil {
 		t.Fatal(err)
 	}
-	if len(catNoControl.Tracks) != 4 {
-		t.Fatalf("without control: track count = %d, want 4", len(catNoControl.Tracks))
+	if len(catNoControl.Tracks) != 3 {
+		t.Fatalf("without control: track count = %d, want 3", len(catNoControl.Tracks))
 	}
 
-	// With control enabled: 5 tracks (video + audio0 + captions + stats + control)
+	// With control enabled: 4 tracks (video + captions + stats + control)
 	dataWithControl, err := buildMoQCatalog("test", relay, true)
 	if err != nil {
 		t.Fatal(err)
@@ -216,12 +263,12 @@ func TestBuildMoQCatalogControlTrack(t *testing.T) {
 	if err := json.Unmarshal(dataWithControl, &catWithControl); err != nil {
 		t.Fatal(err)
 	}
-	if len(catWithControl.Tracks) != 5 {
-		t.Fatalf("with control: track count = %d, want 5", len(catWithControl.Tracks))
+	if len(catWithControl.Tracks) != 4 {
+		t.Fatalf("with control: track count = %d, want 4", len(catWithControl.Tracks))
 	}
 
 	// Verify the control track is last and has the right codec
-	controlTrack := catWithControl.Tracks[4]
+	controlTrack := catWithControl.Tracks[3]
 	if controlTrack.Name != "control" {
 		t.Fatalf("control track name = %q, want %q", controlTrack.Name, "control")
 	}
