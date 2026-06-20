@@ -341,10 +341,16 @@ func (m *MoQSession) handleSubscribe(ctx context.Context, sub moq.Subscribe) {
 
 // handleCatalogSubscribe builds and delivers the catalog, then sends SUBSCRIBE_OK.
 func (m *MoQSession) handleCatalogSubscribe(ctx context.Context, sub moq.Subscribe, alias uint64) {
-	catalogJSON, err := buildMoQCatalog(m.streamKey, m.relay, m.controlBroadcaster != nil)
-	if err != nil {
-		m.sendSubscribeError(sub.RequestID, 500, "catalog build failed")
-		return
+	// A relayed stream re-serves the upstream publisher's catalog verbatim; only
+	// origin streams synthesize a catalog from observed pipeline state.
+	catalogJSON := m.relay.Catalog()
+	if catalogJSON == nil {
+		var err error
+		catalogJSON, err = buildMoQCatalog(m.streamKey, m.relay, m.controlBroadcaster != nil)
+		if err != nil {
+			m.sendSubscribeError(sub.RequestID, 500, "catalog build failed")
+			return
+		}
 	}
 
 	if err := writeCatalogObject(ctx, m.session, alias, catalogJSON); err != nil {

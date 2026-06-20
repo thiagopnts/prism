@@ -132,6 +132,61 @@ func (m *moqWriter) StreamHeaderSize() int64 {
 	return int64(size)
 }
 
+// RawStreamWriter writes MoQ subgroup framing from caller-supplied field values,
+// forwarding the extension block verbatim. Unlike moqWriter it does NOT renumber
+// object IDs or synthesize capture-timestamp / frame-marking extensions: a relay
+// tier re-serves an upstream publisher's objects byte-for-byte (group, subgroup
+// and object IDs, the extension block, and the payload all preserved), rewriting
+// only the session-scoped track alias to the downstream viewer's negotiated
+// value. One RawStreamWriter is used per downstream uni-stream (subgroup); the
+// caller writes the header once, then one or more objects.
+type RawStreamWriter struct {
+	trackAlias uint64
+}
+
+// NewRawStreamWriter returns a writer that emits subgroup framing for the given
+// session-scoped downstream track alias.
+func NewRawStreamWriter(trackAlias uint64) *RawStreamWriter {
+	return &RawStreamWriter{trackAlias: trackAlias}
+}
+
+// WriteRawStreamHeader writes the subgroup stream header. Call once per
+// uni-stream, before any WriteRawObject. groupID, subgroupID and priority are
+// taken verbatim from the upstream subgroup; only the track alias is the
+// downstream session's.
+func (w *RawStreamWriter) WriteRawStreamHeader(out io.Writer, groupID, subgroupID uint64, priority byte) error {
+	var buf []byte
+	buf = quicvarint.Append(buf, moqStreamTypeSubgroupSIDExt)
+	buf = quicvarint.Append(buf, w.trackAlias)
+	buf = quicvarint.Append(buf, groupID)
+	buf = quicvarint.Append(buf, subgroupID)
+	buf = append(buf, priority)
+
+	_, err := out.Write(buf)
+	return err
+}
+
+// WriteRawObject writes a single object: the caller-supplied object ID, the
+// verbatim extension block (length-prefixed), then the payload (length-prefixed).
+// extBytes is forwarded unchanged — pass nil/empty for an object with no
+// extensions. Returns the number of bytes written.
+func (w *RawStreamWriter) WriteRawObject(out io.Writer, objectID uint64, extBytes, payload []byte) (int64, error) {
+	var hdr []byte
+	hdr = quicvarint.Append(hdr, objectID)
+	hdr = quicvarint.Append(hdr, uint64(len(extBytes)))
+	hdr = append(hdr, extBytes...)
+	hdr = quicvarint.Append(hdr, uint64(len(payload)))
+
+	total := int64(len(hdr) + len(payload))
+	if _, err := out.Write(hdr); err != nil {
+		return 0, err
+	}
+	if _, err := out.Write(payload); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
 // writeObject writes a MoQ object header (with extensions) and payload.
 func (m *moqWriter) writeObject(w io.Writer, exts []byte, payload []byte) (int64, error) {
 	var hdr []byte

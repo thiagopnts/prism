@@ -259,6 +259,32 @@ func (s *Server) RegisterStream(streamKey string) *Relay {
 	return r
 }
 
+// RegisterRelayedStream creates a Relay for streamKey that re-serves the given
+// verbatim upstream catalog to viewers, instead of synthesizing one from
+// observed pipeline state. Use it for relay/pull tiers that forward another
+// publisher's already-final stream: no init window is applied and viewers are
+// not gated on the first keyframe (see Relay.SetCatalog). If the stream already
+// has a relay, its catalog is updated to the supplied bytes and the existing
+// relay is returned. For new streams, OnStreamRegistered is called (if set)
+// after releasing the lock.
+func (s *Server) RegisterRelayedStream(streamKey string, catalog []byte) *Relay {
+	s.mu.Lock()
+	if sr, ok := s.streams[streamKey]; ok {
+		s.mu.Unlock()
+		sr.relay.SetCatalog(catalog)
+		return sr.relay
+	}
+	r := NewRelay()
+	r.SetCatalog(catalog)
+	s.streams[streamKey] = &streamResources{relay: r}
+	s.mu.Unlock()
+
+	if s.config.OnStreamRegistered != nil {
+		s.config.OnStreamRegistered(streamKey, r)
+	}
+	return r
+}
+
 // UnregisterStream removes the relay and pipeline for a stream key.
 // If the stream existed, OnStreamUnregistered is called (if set) after
 // releasing the lock. If a concurrent RegisterStream for the same key

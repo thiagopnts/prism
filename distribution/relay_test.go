@@ -425,6 +425,50 @@ func TestRelayInitWindowDropsThenForwards(t *testing.T) {
 	}
 }
 
+func TestRelaySetCatalogServesVerbatimAndReady(t *testing.T) {
+	t.Parallel()
+
+	r := NewRelay()
+	r.SetInitWindow(time.Hour) // a window that would otherwise block viewers
+
+	if r.Catalog() != nil {
+		t.Fatal("Catalog should be nil before SetCatalog")
+	}
+
+	upstream := []byte(`{"version":1,"tracks":[{"name":"video"}]}`)
+	r.SetCatalog(upstream)
+
+	if got := r.Catalog(); string(got) != string(upstream) {
+		t.Fatalf("Catalog = %q, want %q", got, upstream)
+	}
+
+	// SetCatalog marks video info and the catalog immediately ready despite the
+	// long init window, so viewers never block on track discovery.
+	if !r.WaitVideoInfo(canceledContext()) {
+		t.Error("WaitVideoInfo should be true after SetCatalog")
+	}
+	if !r.WaitCatalogReady(canceledContext()) {
+		t.Error("WaitCatalogReady should be true after SetCatalog")
+	}
+
+	// Frames forward immediately — the init window is disabled, not pending.
+	v := newMockViewer("v1")
+	r.AddViewer(v)
+	r.BroadcastVideo(&media.VideoFrame{IsKeyframe: true, NALUs: [][]byte{{0x65}}})
+	r.BroadcastAudio(&media.AudioFrame{TrackIndex: 0, SampleRate: 48000, Channels: 2})
+	if v.videoSent.Load() != 1 || v.audioSent.Load() != 1 {
+		t.Fatalf("frames not forwarded after SetCatalog: video=%d audio=%d",
+			v.videoSent.Load(), v.audioSent.Load())
+	}
+
+	// Re-announce: replacing the catalog is safe (no panic / double-close).
+	updated := []byte(`{"version":1,"tracks":[{"name":"video"},{"name":"audio0"}]}`)
+	r.SetCatalog(updated)
+	if got := r.Catalog(); string(got) != string(updated) {
+		t.Fatalf("Catalog after re-announce = %q, want %q", got, updated)
+	}
+}
+
 // canceledContext returns an already-cancelled context for non-blocking checks.
 func canceledContext() context.Context {
 	ctx, cancel := context.WithCancel(context.Background())

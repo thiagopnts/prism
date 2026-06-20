@@ -409,3 +409,70 @@ func TestStreamLifecycleCallbacks(t *testing.T) {
 		// If we get here without panicking, the test passes.
 	})
 }
+
+func TestRegisterRelayedStream(t *testing.T) {
+	t.Parallel()
+
+	cert, err := certs.Generate(24 * 60 * 60 * 1e9)
+	if err != nil {
+		t.Fatalf("certs.Generate: %v", err)
+	}
+
+	catalog := []byte(`{"version":1,"tracks":[{"name":"video"}]}`)
+
+	t.Run("new stream serves the forwarded catalog and is immediately ready", func(t *testing.T) {
+		t.Parallel()
+
+		var gotKey string
+		srv, err := NewServer(ServerConfig{
+			Addr:               ":0",
+			Cert:               cert,
+			OnStreamRegistered: func(key string, _ *Relay) { gotKey = key },
+		})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+
+		relay := srv.RegisterRelayedStream("cam1", catalog)
+		if gotKey != "cam1" {
+			t.Fatalf("OnStreamRegistered key = %q, want %q", gotKey, "cam1")
+		}
+		if got := relay.Catalog(); string(got) != string(catalog) {
+			t.Fatalf("Catalog = %q, want %q", got, catalog)
+		}
+		if !relay.WaitVideoInfo(canceledContext()) || !relay.WaitCatalogReady(canceledContext()) {
+			t.Fatal("relayed stream should be immediately ready (no init window / keyframe wait)")
+		}
+		if srv.GetRelay("cam1") != relay {
+			t.Fatal("GetRelay should return the registered relay")
+		}
+	})
+
+	t.Run("duplicate updates the catalog and returns the same relay", func(t *testing.T) {
+		t.Parallel()
+
+		callCount := 0
+		srv, err := NewServer(ServerConfig{
+			Addr:               ":0",
+			Cert:               cert,
+			OnStreamRegistered: func(_ string, _ *Relay) { callCount++ },
+		})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+
+		first := srv.RegisterRelayedStream("cam1", catalog)
+		updated := []byte(`{"version":1,"tracks":[{"name":"video"},{"name":"audio0"}]}`)
+		second := srv.RegisterRelayedStream("cam1", updated)
+
+		if first != second {
+			t.Fatal("duplicate RegisterRelayedStream should return the same relay")
+		}
+		if got := second.Catalog(); string(got) != string(updated) {
+			t.Fatalf("Catalog after duplicate = %q, want %q", got, updated)
+		}
+		if callCount != 1 {
+			t.Fatalf("OnStreamRegistered called %d times, want 1", callCount)
+		}
+	})
+}

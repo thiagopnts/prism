@@ -85,6 +85,12 @@ type Relay struct {
 	videoInfoSet   bool
 	videoInfoReady chan struct{}
 
+	// forwardedCatalog, when non-nil, is a verbatim upstream catalog re-served
+	// to every viewer instead of one synthesized from observed video/audio
+	// state. Set via SetCatalog by relay/pull tiers that forward another
+	// publisher's already-final catalog unchanged. Guarded by mu.
+	forwardedCatalog []byte
+
 	// Init window: observe which tracks the feed carries before freezing the
 	// catalog. A Relay built directly has windowEnabled=false and
 	// catalogFrozen=true, so it forwards immediately with no window; the server
@@ -101,6 +107,13 @@ type Relay struct {
 	audioMu       sync.RWMutex
 	audioCache    map[int][]*media.AudioFrame
 	observedAudio map[int]AudioInfo // audio tracks seen in the feed; guarded by audioMu
+
+	// Raw relay path: per-track verbatim-object fan-out and replay, used when the
+	// stream is re-served byte-for-byte from an upstream MoQ publisher. Entirely
+	// separate from the media path above so origin streams are unaffected. See
+	// relayed.go.
+	rawMu     sync.RWMutex
+	rawTracks map[string]*rawTrack
 }
 
 // NewRelay creates a Relay with no viewers.
@@ -112,6 +125,7 @@ func NewRelay() *Relay {
 		catalogReady:   make(chan struct{}),
 		audioCache:     make(map[int][]*media.AudioFrame),
 		observedAudio:  make(map[int]AudioInfo),
+		rawTracks:      make(map[string]*rawTrack),
 	}
 	// No init window by default: forward immediately and treat the catalog as
 	// ready. The server opts into the window via SetInitWindow.
@@ -223,6 +237,37 @@ func (r *Relay) WaitCatalogReady(ctx context.Context) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// SetCatalog installs a verbatim upstream catalog for the relay to re-serve to
+// every viewer, instead of synthesizing one from observed video/audio state. It
+// is for relay/pull tiers that forward another publisher's stream unchanged:
+// because the upstream catalog is already final, SetCatalog also marks the
+// relay's video info and catalog as immediately ready, so viewers never wait on
+// an init window or the first keyframe. Safe to call again to replace the
+// catalog (e.g. on upstream re-announce); the caller must not mutate the slice
+// after the call.
+func (r *Relay) SetCatalog(catalog []byte) {
+	r.mu.Lock()
+	r.forwardedCatalog = catalog
+	if !r.videoInfoSet {
+		r.videoInfoSet = true
+		close(r.videoInfoReady)
+	}
+	r.mu.Unlock()
+
+	// The forwarded catalog is final: disable any init window and freeze the
+	// catalog so the WaitVideoInfo / WaitCatalogReady gates pass immediately.
+	r.windowEnabled.Store(false)
+	r.freezeCatalog()
+}
+
+// Catalog returns the verbatim upstream catalog installed via SetCatalog, or
+// nil if this relay synthesizes its catalog from observed state.
+func (r *Relay) Catalog() []byte {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.forwardedCatalog
 }
 
 // AddViewer replays the cached GOP to the viewer, then registers it for
