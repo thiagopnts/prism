@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -193,10 +194,15 @@ type ServerConfig struct {
 }
 
 // streamResources bundles the relay and stats provider for a single live
-// stream, ensuring both are registered and torn down as a unit.
+// stream, ensuring both are registered and torn down as a unit. For a relayed
+// (moq→moq) stream registered via RegisterRelayedUpstream it also holds the
+// puller and the cancel for its connection parent context, both torn down with
+// the stream.
 type streamResources struct {
-	relay    *Relay
-	pipeline StatsProvider
+	relay          *Relay
+	pipeline       StatsProvider
+	puller         *RelayPuller       // non-nil only for RegisterRelayedUpstream streams
+	upstreamCancel context.CancelFunc // cancels the puller's connection parent context
 }
 
 // Server is the WebTransport/HTTP3 distribution server. It manages relays,
@@ -285,18 +291,102 @@ func (s *Server) RegisterRelayedStream(streamKey string, catalog []byte) *Relay 
 	return r
 }
 
+// RegisterRelayedUpstream registers a relayed (moq→moq) stream that lazily pulls
+// from an upstream prism distribution server. It is pure bookkeeping: it creates a
+// cold relay, binds a RelayPuller for cfg, and records both — but opens no
+// connection and fetches no catalog. The pull starts only when the first viewer
+// connects (handleMoQ calls Relay.EnsureUpstream before the catalog gate), so a
+// registered-but-unwatched stream costs nothing. If cfg.StreamKey is empty it
+// defaults to streamKey (the common case where the local and upstream keys match).
+//
+// If the stream is already registered, its upstream is updated in place (addr /
+// cert-hash change applied via the puller, see SetRelayedUpstream) and the
+// existing relay is returned. For new streams, OnStreamRegistered is called (if
+// set) after releasing the lock.
+func (s *Server) RegisterRelayedUpstream(streamKey string, cfg UpstreamConfig) *Relay {
+	if cfg.StreamKey == "" {
+		cfg.StreamKey = streamKey
+	}
+
+	s.mu.Lock()
+	if sr, ok := s.streams[streamKey]; ok {
+		// Apply any upstream change while still holding s.mu, so a concurrent
+		// UnregisterStream cannot delete + cancel this stream between the lookup and
+		// the update and leave us returning an orphaned relay whose upstream context
+		// is already cancelled. SetUpstream only takes the puller lock — s.mu →
+		// puller.mu is a fresh, acyclic order (nothing takes s.mu under puller.mu).
+		if sr.puller != nil {
+			sr.puller.SetUpstream(cfg.Addr, cfg.CertHashes)
+		}
+		relay := sr.relay
+		s.mu.Unlock()
+		return relay
+	}
+	r := NewRelay()
+	upCtx, upCancel := context.WithCancel(context.Background())
+	puller := NewRelayPuller(r, cfg)
+	r.attachPuller(puller, upCtx)
+	s.streams[streamKey] = &streamResources{relay: r, puller: puller, upstreamCancel: upCancel}
+	s.mu.Unlock()
+
+	if s.config.OnStreamRegistered != nil {
+		s.config.OnStreamRegistered(streamKey, r)
+	}
+	return r
+}
+
+// SetRelayedUpstream updates the upstream dial target and cert-hash trust set for
+// an already-registered relayed stream (e.g. cert rotation or address failover),
+// without tearing down a healthy connection when nothing changed. It returns true
+// if the upstream actually changed (a live connection is dropped so the puller
+// reconnects against it), false on a no-op or an unknown / non-relayed stream.
+func (s *Server) SetRelayedUpstream(streamKey, addr string, certHashes []string) bool {
+	s.mu.RLock()
+	sr := s.streams[streamKey]
+	s.mu.RUnlock()
+	if sr == nil || sr.puller == nil {
+		return false
+	}
+	return sr.puller.SetUpstream(addr, certHashes)
+}
+
 // UnregisterStream removes the relay and pipeline for a stream key.
 // If the stream existed, OnStreamUnregistered is called (if set) after
 // releasing the lock. If a concurrent RegisterStream for the same key
 // races with this call, the callback may fire after a new relay has
 // already been registered.
 func (s *Server) UnregisterStream(streamKey string) {
+	s.unregister(streamKey)
+}
+
+// UnregisterRelayedStream removes a relayed stream registered via
+// RegisterRelayedUpstream, stopping its puller and cancelling its connection
+// parent context. It is the named counterpart to RegisterRelayedUpstream; the
+// teardown is identical to UnregisterStream (which also stops a puller if present),
+// so either is safe to call.
+func (s *Server) UnregisterRelayedStream(streamKey string) {
+	s.unregister(streamKey)
+}
+
+// unregister removes a stream and tears down any puller it held, then fires
+// OnStreamUnregistered (only if the stream existed). Cancelling upstreamCancel
+// stops the connection goroutine; relay.shutdownUpstream stops the puller and
+// cancels every pending grace/idle timer so none keeps the unregistered relay
+// alive for its grace duration. Both are no-ops for an origin stream.
+func (s *Server) unregister(streamKey string) {
 	s.mu.Lock()
-	_, existed := s.streams[streamKey]
+	sr, existed := s.streams[streamKey]
 	delete(s.streams, streamKey)
 	s.mu.Unlock()
 
-	if existed && s.config.OnStreamUnregistered != nil {
+	if !existed {
+		return
+	}
+	if sr.upstreamCancel != nil {
+		sr.upstreamCancel()
+	}
+	sr.relay.shutdownUpstream()
+	if s.config.OnStreamUnregistered != nil {
 		s.config.OnStreamUnregistered(streamKey)
 	}
 }
@@ -468,6 +558,15 @@ func (s *Server) handleMoQ(w http.ResponseWriter, r *http.Request) {
 		return // setupMoQ already logged and closed the session
 	}
 
+	// For a relayed (moq→moq) stream the upstream is pulled lazily: this viewer's
+	// connect brings the shared connection up and fetches the catalog, which is
+	// what unblocks the WaitCatalogReady gate below; if the upstream is down the
+	// gate times out cleanly for just this viewer. ReleaseUpstream (deferred) drops
+	// the connection-presence refcount so the connection is torn down after a grace
+	// once the last viewer leaves. Both are no-ops for an origin stream (no puller).
+	relay.EnsureUpstream()
+	defer relay.ReleaseUpstream()
+
 	waitCtx, waitCancel := context.WithTimeout(r.Context(), videoInfoTimeout)
 	defer waitCancel()
 	relay.WaitVideoInfo(waitCtx)
@@ -571,11 +670,93 @@ func (s *Server) handleListStreams(w http.ResponseWriter, _ *http.Request) {
 		resp = s.config.StreamLister()
 	}
 
+	resp = s.appendRelayedStreamInfos(resp)
+
 	if resp == nil {
 		resp = make([]StreamInfo, 0)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// RelayedStreamInfos returns a StreamInfo for every relayed (moq→moq) stream
+// registered on this server: idle streams show minimal data (key, protocol,
+// viewer count); actively-relayed ones add codec / resolution / track counts
+// parsed read-only from the verbatim catalog they already hold. It is the
+// public, origin-free counterpart of the relayed half of handleListStreams, for
+// callers that serve their own /api/streams on a separate listener from this
+// server's WebTransport endpoint and want to merge relayed streams into it.
+// Nothing is fetched eagerly.
+func (s *Server) RelayedStreamInfos() []StreamInfo {
+	infos := s.appendRelayedStreamInfos(nil)
+	if infos == nil {
+		return []StreamInfo{}
+	}
+	return infos
+}
+
+// appendRelayedStreamInfos adds a StreamInfo for every relayed (moq→moq) stream
+// not already present in existing (deduped by key, so a StreamLister entry wins).
+// An idle relayed stream shows minimal data (key, protocol, viewer count); an
+// actively-relayed one additionally has codec / resolution / track counts parsed
+// read-only from the verbatim upstream catalog it already holds.
+func (s *Server) appendRelayedStreamInfos(existing []StreamInfo) []StreamInfo {
+	seen := make(map[string]struct{}, len(existing))
+	for _, si := range existing {
+		seen[si.Key] = struct{}{}
+	}
+
+	type relayedStream struct {
+		key   string
+		relay *Relay
+	}
+	s.mu.RLock()
+	relayed := make([]relayedStream, 0, len(s.streams))
+	for key, sr := range s.streams {
+		if sr.puller != nil {
+			relayed = append(relayed, relayedStream{key: key, relay: sr.relay})
+		}
+	}
+	s.mu.RUnlock()
+
+	for _, e := range relayed {
+		if _, dup := seen[e.key]; dup {
+			slog.Debug("Ignoring duplicated stream", "feed_id", e.key)
+			continue
+		}
+		si := StreamInfo{
+			Key:      e.key,
+			Protocol: "moq-relay",
+			Viewers:  e.relay.ViewerCount(),
+		}
+		if cat := e.relay.Catalog(); cat != nil {
+			applyCatalogInfo(&si, cat)
+		}
+		existing = append(existing, si)
+	}
+	return existing
+}
+
+// applyCatalogInfo fills the display-only codec / resolution / track-count fields
+// of si from a verbatim MoQ catalog by unmarshalling it read-only into the same
+// struct buildMoQCatalog produces. A malformed catalog leaves si unchanged.
+func applyCatalogInfo(si *StreamInfo, catalog []byte) {
+	var c moqCatalog
+	if err := json.Unmarshal(catalog, &c); err != nil {
+		return
+	}
+	for _, t := range c.Tracks {
+		switch {
+		case t.Name == "video":
+			si.VideoCodec = t.SelectionParams.Codec
+			si.Width = t.SelectionParams.Width
+			si.Height = t.SelectionParams.Height
+		case t.Name == "captions":
+			si.HasCaptions = true
+		case strings.HasPrefix(t.Name, "audio"):
+			si.AudioTracks++
+		}
+	}
 }
 
 func (s *Server) handleStreamDebug(w http.ResponseWriter, r *http.Request) {

@@ -253,7 +253,7 @@ func TestReadObject_UnknownExtensionSkipped(t *testing.T) {
 }
 
 // TestReadObject_RawExtBytesVerbatim asserts the raw extension block is captured
-// byte-for-byte so a relay can re-serve it without re-encoding (Gotcha #7).
+// byte-for-byte so a relay can re-serve it without re-encoding.
 func TestReadObject_RawExtBytesVerbatim(t *testing.T) {
 	var extsBytes []byte
 	extsBytes = append(extsBytes, buildExtEven(ExtCaptureTimestamp, 1234567)...)

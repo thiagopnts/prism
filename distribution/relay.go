@@ -114,6 +114,26 @@ type Relay struct {
 	// relayed.go.
 	rawMu     sync.RWMutex
 	rawTracks map[string]*rawTrack
+
+	// Per-track refcounted upstream subscription for a relayed stream. puller is
+	// nil for an origin relay (no upstream to pull from); when set, AcquireTrack /
+	// ReleaseTrack drive its per-track Subscribe / Unsubscribe so the relay holds
+	// exactly one upstream subscription per track that any viewer is watching, and
+	// drops it (after a grace period) once the last viewer leaves. The connection
+	// itself is edge-triggered on viewer presence: EnsureUpstream (0→1) starts the
+	// puller, ReleaseUpstream (1→0) tears it down after idleGraceDur. connRefs is
+	// the connection-presence count, idleStop the pending teardown timer, idleGen a
+	// stale-callback guard, upstreamCtx the puller's connection parent context. All
+	// guarded by trackMu. See relayed.go.
+	trackMu      sync.Mutex
+	puller       upstreamPuller
+	tracks       map[string]*trackState
+	graceDur     time.Duration
+	upstreamCtx  context.Context
+	connRefs     int
+	idleStop     *time.Timer
+	idleGen      uint64
+	idleGraceDur time.Duration
 }
 
 // NewRelay creates a Relay with no viewers.
@@ -126,6 +146,9 @@ func NewRelay() *Relay {
 		audioCache:     make(map[int][]*media.AudioFrame),
 		observedAudio:  make(map[int]AudioInfo),
 		rawTracks:      make(map[string]*rawTrack),
+		tracks:         make(map[string]*trackState),
+		graceDur:       defaultTrackGrace,
+		idleGraceDur:   defaultTrackGrace,
 	}
 	// No init window by default: forward immediately and treat the catalog as
 	// ready. The server opts into the window via SetInitWindow.

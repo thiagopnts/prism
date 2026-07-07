@@ -1,5 +1,10 @@
 package distribution
 
+import (
+	"context"
+	"time"
+)
+
 // This file holds the raw-relay data path: the types and Relay methods used when
 // a stream is re-served verbatim from an upstream MoQ publisher rather than
 // produced by a local pipeline. The raw path forwards subgroup objects
@@ -20,13 +25,22 @@ package distribution
 //
 // There is deliberately no TrackAlias field: the alias is session-scoped and
 // assigned per downstream viewer at write time (see RawStreamWriter).
+//
+// StartsStream marks the first object of an upstream subgroup stream. A
+// downstream writer opens a new uni-stream for it (mirroring the upstream's
+// stream boundaries exactly rather than inferring them from GroupID, which is
+// ambiguous for audio). It is set by the puller as it begins
+// reading each upstream stream and is preserved through the replay buffer, so a
+// late joiner replaying a video group sees StartsStream on the keyframe that
+// opened the group.
 type RawObject struct {
-	GroupID    uint64
-	SubgroupID uint64
-	ObjectID   uint64
-	Priority   byte
-	ExtBytes   []byte
-	Payload    []byte
+	GroupID      uint64
+	SubgroupID   uint64
+	ObjectID     uint64
+	Priority     byte
+	ExtBytes     []byte
+	Payload      []byte
+	StartsStream bool
 }
 
 // RawViewer receives verbatim subgroup objects for a single track. It is the
@@ -133,8 +147,8 @@ func (r *Relay) EnsureRawTrack(trackKey string, policy RawReplayPolicy) {
 // default ReplayCurrentGroup policy if it was never registered. Creation here
 // means the caller skipped pre-registration: the puller is expected to
 // EnsureRawTrack with the track's correct shape before its objects flow, because
-// the default is wrong for an audio track (which needs ReplayRecentRing — see
-// Gotcha #1). It is logged once per track (the create branch runs once) rather
+// the default is wrong for an audio track (which needs ReplayRecentRing).
+// It is logged once per track (the create branch runs once) rather
 // than silently defaulting, so a missed pre-registration is visible instead of
 // surfacing later as a late-joiner-misses-audio symptom. Caller holds rawMu.
 func (r *Relay) getOrCreateRawTrackLocked(trackKey string) *rawTrack {
@@ -195,4 +209,234 @@ func (r *Relay) RawViewerCount(trackKey string) int {
 		return len(t.viewers)
 	}
 	return 0
+}
+
+// defaultTrackGrace is how long a track stays subscribed upstream after its last
+// downstream viewer leaves, so a viewer who flips away and back (or reconnects)
+// does not force an unsubscribe/resubscribe round trip.
+const defaultTrackGrace = 30 * time.Second
+
+// trackPuller is the upstream side that Relay.AcquireTrack / ReleaseTrack drive:
+// a refcount transition from 0→1 viewers Subscribes the track upstream and 1→0
+// (after a grace period) Unsubscribes it. Both Subscribe and Unsubscribe are
+// idempotent per track.
+type trackPuller interface {
+	Subscribe(trackName string)
+	Unsubscribe(trackName string)
+}
+
+// upstreamPuller is the full upstream side a relayed Relay drives: the per-track
+// refcount (trackPuller) plus the connection lifecycle, which is edge-triggered on
+// viewer presence (EnsureUpstream / ReleaseUpstream). EnsureStarted brings the
+// shared upstream connection up and Stop tears it down so a later
+// EnsureStarted can restart it.
+type upstreamPuller interface {
+	trackPuller
+	EnsureStarted(ctx context.Context)
+	Stop()
+}
+
+// trackState is the per-track refcount bookkeeping for a relayed stream. Guarded
+// by Relay.trackMu.
+type trackState struct {
+	// refs is the number of downstream viewers currently watching the track.
+	refs int
+	// subscribed is whether an upstream SUBSCRIBE is currently held for the
+	// track. It stays true through the grace window (refs==0 but not yet
+	// unsubscribed) so a re-acquire within grace needs no new SUBSCRIBE.
+	subscribed bool
+	// grace, when non-nil, is the pending unsubscribe timer started when refs
+	// hit 0; AcquireTrack stops it on re-acquire.
+	grace *time.Timer
+}
+
+// attachPuller binds the upstream puller that AcquireTrack / ReleaseTrack and the
+// connection lifecycle (EnsureUpstream / ReleaseUpstream) drive, marking this relay
+// as a relayed (moq→moq) stream rather than an origin one. runCtx is the parent
+// context for the puller's connection goroutine: it must outlive any single viewer,
+// and is cancelled when the stream is unregistered.
+// Called once at registration, before the relay is exposed to any viewer.
+func (r *Relay) attachPuller(p upstreamPuller, runCtx context.Context) {
+	r.trackMu.Lock()
+	r.puller = p
+	r.upstreamCtx = runCtx
+	if r.graceDur <= 0 {
+		r.graceDur = defaultTrackGrace
+	}
+	if r.idleGraceDur <= 0 {
+		r.idleGraceDur = defaultTrackGrace
+	}
+	r.trackMu.Unlock()
+}
+
+// isRelayed reports whether this relay re-serves an upstream stream (has a
+// puller) rather than originating one locally. The MoQ session forks its
+// subscribe handling on this: relayed → verbatim raw path, origin → media path.
+func (r *Relay) isRelayed() bool {
+	r.trackMu.Lock()
+	defer r.trackMu.Unlock()
+	return r.puller != nil
+}
+
+// AcquireTrack records one more downstream viewer for trackName and, on the
+// 0→1 transition (or a re-acquire during the unsubscribe grace window),
+// guarantees an upstream subscription. It is a no-op for an origin relay (no
+// puller). The puller call happens under trackMu so a concurrent grace-expiry
+// Unsubscribe and this Subscribe cannot reorder (see ReleaseTrack).
+func (r *Relay) AcquireTrack(trackName string) {
+	r.trackMu.Lock()
+	defer r.trackMu.Unlock()
+	if r.puller == nil {
+		return
+	}
+	ts := r.tracks[trackName]
+	if ts == nil {
+		ts = &trackState{}
+		r.tracks[trackName] = ts
+	}
+	if ts.grace != nil {
+		ts.grace.Stop()
+		ts.grace = nil
+	}
+	ts.refs++
+	if !ts.subscribed {
+		ts.subscribed = true
+		r.puller.Subscribe(trackName)
+	}
+}
+
+// ReleaseTrack records one fewer downstream viewer for trackName. On the 1→0
+// transition it starts a grace timer; if no viewer returns before it fires the
+// track is unsubscribed upstream. No-op for an origin relay or an unknown /
+// already-zero track.
+func (r *Relay) ReleaseTrack(trackName string) {
+	r.trackMu.Lock()
+	defer r.trackMu.Unlock()
+	if r.puller == nil {
+		return
+	}
+	ts := r.tracks[trackName]
+	if ts == nil || ts.refs == 0 {
+		return
+	}
+	ts.refs--
+	if ts.refs == 0 && ts.grace == nil {
+		ts.grace = time.AfterFunc(r.graceDur, func() { r.onGraceExpired(trackName) })
+	}
+}
+
+// onGraceExpired fires when a track's unsubscribe grace window elapses. It
+// unsubscribes upstream only if the track is still idle and this is still the
+// active grace timer (AcquireTrack nils ts.grace when it re-acquires within the
+// window, which makes this a no-op). The Unsubscribe call is under trackMu so it
+// is ordered with respect to a racing AcquireTrack's Subscribe.
+func (r *Relay) onGraceExpired(trackName string) {
+	r.trackMu.Lock()
+	defer r.trackMu.Unlock()
+	ts := r.tracks[trackName]
+	if ts == nil || ts.grace == nil || ts.refs != 0 {
+		return
+	}
+	ts.grace = nil
+	ts.subscribed = false
+	if r.puller != nil {
+		r.puller.Unsubscribe(trackName)
+	}
+}
+
+// EnsureUpstream records that a viewer is connecting and guarantees the shared
+// upstream connection is up. It is called by the server for every viewer of a
+// relayed stream right before the catalog gate, so the first viewer's connect is
+// what brings the connection up and fetches the catalog (which is what unblocks
+// the gate); subsequent concurrent viewers find it already started (EnsureStarted
+// is idempotent). It also cancels any pending idle-stop so a viewer arriving
+// during the grace keeps the connection. No-op for an origin relay (no puller).
+//
+// EnsureStarted runs under trackMu (the trackMu→puller-lock order matches
+// AcquireTrack), so it is fully serialised with onUpstreamIdle's Stop: a viewer
+// arriving as the grace fires either bumps connRefs before the timer callback
+// takes the lock (which then sees connRefs!=0 and bails) or after Stop already
+// ran (and gets a fresh connection). The connection is never torn down with a
+// viewer present.
+func (r *Relay) EnsureUpstream() {
+	r.trackMu.Lock()
+	defer r.trackMu.Unlock()
+	if r.puller == nil {
+		return
+	}
+	r.connRefs++
+	if r.idleStop != nil {
+		r.idleStop.Stop()
+		r.idleStop = nil
+	}
+	r.puller.EnsureStarted(r.upstreamCtx)
+}
+
+// ReleaseUpstream records that a viewer of a relayed stream has gone. On the
+// transition to zero connected viewers it starts an idle-stop grace; if no viewer
+// returns before it fires, the shared upstream connection is torn down (so a
+// registered-but-unwatched relay holds no upstream subscription). Paired 1:1 with
+// EnsureUpstream by the server (deferred), independent of AddViewer/RemoveViewer.
+// No-op for an origin relay.
+func (r *Relay) ReleaseUpstream() {
+	r.trackMu.Lock()
+	defer r.trackMu.Unlock()
+	if r.puller == nil || r.connRefs == 0 {
+		return
+	}
+	r.connRefs--
+	if r.connRefs == 0 && r.idleStop == nil {
+		r.idleGen++
+		gen := r.idleGen
+		r.idleStop = time.AfterFunc(r.idleGraceDur, func() { r.onUpstreamIdle(gen) })
+	}
+}
+
+// onUpstreamIdle fires when the connection idle-stop grace elapses. It stops the
+// puller only if it is still the active grace timer and no viewer has returned.
+// Two independent guards make a fire-after-cancel callback safe: gen (bumped by
+// every ReleaseUpstream) rejects a callback whose timer a later release/grace
+// cycle superseded, and connRefs!=0 rejects one a re-acquiring EnsureUpstream
+// raced past. The Stop call is under trackMu so it is ordered with respect to a
+// racing EnsureUpstream's EnsureStarted.
+func (r *Relay) onUpstreamIdle(gen uint64) {
+	r.trackMu.Lock()
+	defer r.trackMu.Unlock()
+	if gen != r.idleGen {
+		return
+	}
+	r.idleStop = nil
+	if r.connRefs != 0 {
+		return
+	}
+	if r.puller != nil {
+		r.puller.Stop()
+	}
+}
+
+// shutdownUpstream tears the connection lifecycle down when a relayed stream is
+// unregistered. It cancels every pending timer that would otherwise keep the
+// relay alive for its grace duration — the connection idle-stop and each track's
+// unsubscribe grace — and stops the puller. The idleGen bump and niling each
+// ts.grace make any already-fired-but-not-yet-run timer callback a no-op (they
+// re-check idleGen / ts.grace under trackMu). No-op for an origin relay (no
+// puller). The puller's run goroutine is also cancelled by the server via the
+// upstream parent context; Stop here additionally resets the puller's state.
+func (r *Relay) shutdownUpstream() {
+	r.trackMu.Lock()
+	defer r.trackMu.Unlock()
+	if r.idleStop != nil {
+		r.idleStop.Stop()
+		r.idleStop = nil
+	}
+	r.idleGen++
+	for _, ts := range r.tracks {
+		if ts.grace != nil {
+			ts.grace.Stop()
+			ts.grace = nil
+		}
+	}
+	if r.puller != nil {
+		r.puller.Stop()
+	}
 }

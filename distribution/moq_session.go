@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,11 @@ type moqTrackSub struct {
 	captionCh       chan *ccx.CaptionFrame
 	audioTrackIndex int
 	cancel          context.CancelFunc
+
+	// rawCh is set instead of the media channels for a relayed (verbatim) track:
+	// it carries upstream objects byte-for-byte to writeObjectLoop. Its presence
+	// marks a raw subscription that holds an upstream refcount (see relayed.go).
+	rawCh chan RawObject
 }
 
 // Compile-time interface checks.
@@ -43,15 +49,15 @@ type StatsProviderFunc func(streamKey string) StatsProvider
 // interface so the Relay can fan out frames to it. Internally, it dispatches
 // frames to per-track subscriptions, each with its own write loop and moqWriter.
 type MoQSession struct {
-	id                 string
-	log                *slog.Logger
-	streamKey          string
-	session            *webtransport.Session
-	control            io.ReadWriter
-	controlReader      *bufio.Reader // persistent buffered reader for control stream
-	relay              *Relay
-	statsProvider      StatsProviderFunc
-	controlBroadcaster *ControlBroadcaster
+	id                    string
+	log                   *slog.Logger
+	streamKey             string
+	session               *webtransport.Session
+	control               io.ReadWriter
+	controlReader         *bufio.Reader // persistent buffered reader for control stream
+	relay                 *Relay
+	statsProvider         StatsProviderFunc
+	controlBroadcaster    *ControlBroadcaster
 	onDatagram            func(streamKey string, data []byte) []byte
 	onBidirectionalStream func(streamKey string, stream io.ReadWriteCloser)
 	controlMu             sync.Mutex
@@ -69,6 +75,7 @@ type MoQSession struct {
 	videoDropped   atomic.Int64
 	audioDropped   atomic.Int64
 	captionDropped atomic.Int64
+	rawDropped     atomic.Int64
 	bytesSent      atomic.Int64
 	lastVideoTsMS  atomic.Int64
 	lastAudioTsMS  atomic.Int64
@@ -100,15 +107,15 @@ type MoQSessionConfig struct {
 // NewMoQSession creates a new MoQ session for the given stream key.
 func NewMoQSession(cfg MoQSessionConfig) *MoQSession {
 	return &MoQSession{
-		id:                 cfg.ID,
-		log:                slog.With("session", cfg.ID, "stream", cfg.StreamKey),
-		streamKey:          cfg.StreamKey,
-		session:            cfg.Session,
-		control:            cfg.Control,
-		controlReader:      bufio.NewReader(cfg.Control),
-		relay:              cfg.Relay,
-		statsProvider:      cfg.StatsProvider,
-		controlBroadcaster: cfg.ControlBroadcaster,
+		id:                    cfg.ID,
+		log:                   slog.With("session", cfg.ID, "stream", cfg.StreamKey),
+		streamKey:             cfg.StreamKey,
+		session:               cfg.Session,
+		control:               cfg.Control,
+		controlReader:         bufio.NewReader(cfg.Control),
+		relay:                 cfg.Relay,
+		statsProvider:         cfg.StatsProvider,
+		controlBroadcaster:    cfg.ControlBroadcaster,
 		onDatagram:            cfg.OnDatagram,
 		onBidirectionalStream: cfg.OnBidirectionalStream,
 		subscriptions:         make(map[string]*moqTrackSub),
@@ -192,15 +199,24 @@ func (m *MoQSession) Run(ctx context.Context) error {
 	_ = moq.WriteControlMsg(m.control, moq.MsgGoAway, moq.SerializeGoAway(moq.GoAway{}))
 	m.controlMu.Unlock()
 
-	// Cancel all subscriptions
+	// Cancel all subscriptions and release any upstream track refcounts this
+	// session held. The server-level RemoveViewer does not know which upstream
+	// tracks a session held, so without this a relayed stream's per-track pull
+	// would never wind down when its last viewer disconnects.
 	m.mu.Lock()
-	for _, sub := range m.subscriptions {
+	subs := m.subscriptions
+	m.subscriptions = make(map[string]*moqTrackSub)
+	m.mu.Unlock()
+
+	for name, sub := range subs {
 		if sub.cancel != nil {
 			sub.cancel()
 		}
+		if sub.rawCh != nil {
+			m.relay.ReleaseTrack(name)
+			m.relay.RemoveRawViewer(name, m.id)
+		}
 	}
-	m.subscriptions = make(map[string]*moqTrackSub)
-	m.mu.Unlock()
 
 	return ctx.Err()
 }
@@ -311,6 +327,19 @@ func (m *MoQSession) handleSubscribe(ctx context.Context, sub moq.Subscribe) {
 	m.nextTrackAlias++
 	m.mu.Unlock()
 
+	// A relayed stream re-serves every non-catalog track verbatim from its
+	// upstream publisher; only origin streams produce media/stats locally. The
+	// catalog is served the same way for both (handleCatalogSubscribe already
+	// prefers the verbatim upstream catalog), so it is left to the switch below.
+	if trackName != "catalog" && m.relay.isRelayed() {
+		if isRelayableTrack(trackName) {
+			m.handleRawSubscribe(ctx, sub, alias, trackName)
+		} else {
+			m.sendSubscribeError(sub.RequestID, http.StatusNotFound, moq.ErrUnknownTrack.Error())
+		}
+		return
+	}
+
 	switch trackName {
 	case "catalog":
 		m.handleCatalogSubscribe(ctx, sub, alias)
@@ -414,23 +443,185 @@ func (m *MoQSession) handleMediaSubscribe(ctx context.Context, sub moq.Subscribe
 		"requestID", sub.RequestID)
 }
 
-// handleUnsubscribe cancels a track subscription.
-func (m *MoQSession) handleUnsubscribe(unsub moq.Unsubscribe) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// rawViewerBuffer bounds the per-track queue of verbatim objects awaiting the
+// write loop. Sized to hold a replayed video GOP without dropping at the live
+// edge.
+const rawViewerBuffer = 256
 
-	for name, sub := range m.subscriptions {
-		if sub.requestID == unsub.RequestID {
-			if sub.cancel != nil {
-				sub.cancel()
-			}
-			delete(m.subscriptions, name)
-			m.log.Debug("track unsubscribed",
-				"track", name,
-				"requestID", unsub.RequestID)
-			return
+// isRelayableTrack reports whether a relayed stream forwards trackName verbatim
+// from upstream. It is the origin track set minus "control" (relayed streams
+// carry no local control track) and minus "catalog" (served separately).
+func isRelayableTrack(trackName string) bool {
+	switch trackName {
+	case "video", "captions", "stats":
+		return true
+	}
+	if suffix, ok := strings.CutPrefix(trackName, "audio"); ok {
+		if idx, err := strconv.Atoi(suffix); err == nil && idx >= 0 {
+			return true
 		}
 	}
+	return false
+}
+
+// handleRawSubscribe handles a SUBSCRIBE for a relayed stream by forwarding the
+// track's upstream objects verbatim. It refcounts the upstream subscription
+// (AcquireTrack, 0→1 triggers the upstream SUBSCRIBE), starts the write loop,
+// then registers a raw viewer — which atomically replays the track's current
+// buffer and joins live delivery, so the new viewer never misses or duplicates an
+// object across the join (see Relay.AddRawViewer).
+func (m *MoQSession) handleRawSubscribe(ctx context.Context, sub moq.Subscribe, alias uint64, trackName string) {
+	subCtx, subCancel := context.WithCancel(ctx)
+
+	rawCh := make(chan RawObject, rawViewerBuffer)
+	trackSub := &moqTrackSub{
+		requestID:  sub.RequestID,
+		trackAlias: alias,
+		trackName:  trackName,
+		rawCh:      rawCh,
+		cancel:     subCancel,
+	}
+
+	m.relay.AcquireTrack(trackName)
+
+	// Start the write loop before registering so it drains the replay the
+	// registration pushes into rawCh.
+	go m.writeObjectLoop(subCtx, trackSub)
+
+	viewer := &rawObjectViewer{id: m.id, ch: rawCh, dropped: &m.rawDropped}
+	m.relay.AddRawViewer(trackName, viewer)
+
+	m.mu.Lock()
+	m.subscriptions[trackName] = trackSub
+	m.mu.Unlock()
+
+	m.sendSubscribeOK(sub.RequestID, alias, moq.GroupOrderAscending, false, 0, 0)
+
+	m.log.Debug("raw track subscribed", "track", trackName, "alias", alias, "requestID", sub.RequestID)
+}
+
+// writeObjectLoop forwards verbatim objects for one relayed track to the viewer,
+// reconstructing downstream uni-streams from the upstream stream boundaries (see
+// rawStreamMux).
+func (m *MoQSession) writeObjectLoop(ctx context.Context, sub *moqTrackSub) {
+	mx := &rawStreamMux{
+		w: NewRawStreamWriter(sub.trackAlias),
+		open: func() (io.WriteCloser, error) {
+			s, err := m.session.OpenUniStreamSync(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return s, nil
+		},
+	}
+	defer mx.closeCurrent()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case obj, ok := <-sub.rawCh:
+			if !ok {
+				return
+			}
+			n, err := mx.write(obj)
+			if err != nil {
+				m.log.Debug("raw object write failed", "track", sub.trackName, "error", err)
+				return
+			}
+			m.bytesSent.Add(n)
+		}
+	}
+}
+
+// rawStreamMux reconstructs downstream uni-streams from a sequence of verbatim
+// objects: it opens a new stream whenever an object starts an upstream subgroup
+// stream (RawObject.StartsStream) or none is open yet, then writes the object
+// with its original IDs and extension block. Mirroring the upstream's actual
+// stream boundaries — rather than inferring them from GroupID, which is ambiguous
+// for audio's single boundary-less stream.
+type rawStreamMux struct {
+	w       *RawStreamWriter
+	open    func() (io.WriteCloser, error)
+	current io.WriteCloser
+}
+
+func (mx *rawStreamMux) write(obj RawObject) (int64, error) {
+	if obj.StartsStream || mx.current == nil {
+		mx.closeCurrent()
+		s, err := mx.open()
+		if err != nil {
+			return 0, err
+		}
+		if err := mx.w.WriteRawStreamHeader(s, obj.GroupID, obj.SubgroupID, obj.Priority); err != nil {
+			s.Close()
+			return 0, err
+		}
+		mx.current = s
+	}
+	return mx.w.WriteRawObject(mx.current, obj.ObjectID, obj.ExtBytes, obj.Payload)
+}
+
+func (mx *rawStreamMux) closeCurrent() {
+	if mx.current != nil {
+		mx.current.Close()
+		mx.current = nil
+	}
+}
+
+// rawObjectViewer adapts a track subscription's object channel to the RawViewer
+// interface so a Relay can fan verbatim objects out to it. SendObject must not
+// block (RawViewer contract), so it drops on a full channel.
+type rawObjectViewer struct {
+	id      string
+	ch      chan<- RawObject
+	dropped *atomic.Int64
+}
+
+// Compile-time interface check.
+var _ RawViewer = (*rawObjectViewer)(nil)
+
+func (v *rawObjectViewer) ID() string { return v.id }
+
+func (v *rawObjectViewer) SendObject(obj RawObject) {
+	select {
+	case v.ch <- obj:
+	default:
+		v.dropped.Add(1)
+	}
+}
+
+// handleUnsubscribe cancels a track subscription. For a relayed (raw) track it
+// also drops the raw viewer and releases the upstream refcount so the pull can
+// wind down once no viewer is watching the track.
+func (m *MoQSession) handleUnsubscribe(unsub moq.Unsubscribe) {
+	m.mu.Lock()
+	var found *moqTrackSub
+	var foundName string
+	for name, sub := range m.subscriptions {
+		if sub.requestID == unsub.RequestID {
+			found = sub
+			foundName = name
+			delete(m.subscriptions, name)
+			break
+		}
+	}
+	m.mu.Unlock()
+
+	if found == nil {
+		return
+	}
+	if found.cancel != nil {
+		found.cancel()
+	}
+	// Relay calls are made outside m.mu (they take the relay's locks). ReleaseTrack
+	// (trackMu) precedes RemoveRawViewer (rawMu) to match the trackMu→rawMu
+	// acquisition direction used elsewhere; the two are sequential, not nested.
+	if found.rawCh != nil {
+		m.relay.ReleaseTrack(foundName)
+		m.relay.RemoveRawViewer(foundName, m.id)
+	}
+	m.log.Debug("track unsubscribed", "track", foundName, "requestID", unsub.RequestID)
 }
 
 // sendSubscribeOK sends a SUBSCRIBE_OK on the control stream.
