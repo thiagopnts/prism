@@ -16,23 +16,37 @@ import (
 )
 
 // cancelableReader is a fake uni-stream that records CancelRead, matching the
-// method shape dropStream asserts for.
+// method shape dropStream asserts for. It is safe for concurrent use so a reader
+// goroutine can CancelRead it while the test observes the result.
 type cancelableReader struct {
+	mu        sync.Mutex
 	cancelled bool
 	code      webtransport.StreamErrorCode
 }
 
-func (c *cancelableReader) Read([]byte) (int, error)                  { return 0, io.EOF }
-func (c *cancelableReader) CancelRead(e webtransport.StreamErrorCode) { c.cancelled = true; c.code = e }
+func (c *cancelableReader) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *cancelableReader) CancelRead(e webtransport.StreamErrorCode) {
+	c.mu.Lock()
+	c.cancelled = true
+	c.code = e
+	c.mu.Unlock()
+}
+
+func (c *cancelableReader) state() (bool, webtransport.StreamErrorCode) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cancelled, c.code
+}
 
 func TestDropStreamCancelsCancelableStream(t *testing.T) {
 	c := &cancelableReader{}
 	dropStream(c)
-	if !c.cancelled {
+	cancelled, code := c.state()
+	if !cancelled {
 		t.Fatal("dropStream did not CancelRead a cancelable stream — its flow-control credit would leak")
 	}
-	if c.code != 0 {
-		t.Errorf("dropStream used error code %d, want 0", c.code)
+	if code != 0 {
+		t.Errorf("dropStream used error code %d, want 0", code)
 	}
 	// A reader without CancelRead must be a safe no-op, not a panic.
 	dropStream(bytes.NewReader([]byte("plain")))
@@ -391,4 +405,79 @@ func TestReadStreamCatalogGoesToSetCatalog(t *testing.T) {
 	if relay.RawViewerCount(catalogTrack) != 0 {
 		t.Fatal("catalog should not create a raw track")
 	}
+}
+
+// oneObjectStream serializes a single-object subgroup stream for the given alias
+// and group, consumes its header (as the demux loop does), and returns the
+// headeredStream ready to hand to a track reader.
+func oneObjectStream(t *testing.T, alias, group uint64, payload string) headeredStream {
+	t.Helper()
+	var raw bytes.Buffer
+	w := NewRawStreamWriter(alias)
+	if err := w.WriteRawStreamHeader(&raw, group, 0, 128); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteRawObject(&raw, 0, nil, []byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	r := bufio.NewReader(&raw)
+	hdr, err := moqclient.ReadSubgroupHeader(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return headeredStream{hdr: hdr, r: r, stream: &cancelableReader{}}
+}
+
+// TestTrackReaderResolvesAliasAfterDispatch is the core of the non-blocking
+// alias change: a stream may be dispatched before its SUBSCRIBE_OK resolves the
+// alias, and the reader — not the shared demux loop — waits for it. The alias is
+// set only after both streams are dispatched, proving dispatch did not block on
+// resolution, and both streams are then read in accept order.
+func TestTrackReaderResolvesAliasAfterDispatch(t *testing.T) {
+	relay := NewRelay()
+	relay.EnsureRawTrack("video", ReplayCurrentGroup)
+	cap := &captureViewer{id: "v1"}
+	relay.AddRawViewer("video", cap)
+
+	p := &RelayPuller{relay: relay, log: slog.Default()}
+	aliases := newTrackAliasMap()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	readers := newTrackReaderSet(ctx, p, aliases)
+	defer readers.shutdown()
+
+	// Dispatch two streams for alias 1 BEFORE the alias resolves. If dispatch
+	// blocked on resolution this would deadlock the test.
+	readers.dispatch(1, oneObjectStream(t, 1, 5, "AAA"))
+	readers.dispatch(1, oneObjectStream(t, 1, 6, "BBB"))
+
+	aliases.set(1, "video")
+
+	eventually(t, 2*time.Second, func() bool { return len(cap.objects()) == 2 })
+
+	got := cap.objects()
+	if got[0].GroupID != 5 || got[1].GroupID != 6 {
+		t.Fatalf("objects forwarded out of accept order: groups = %d, %d, want 5, 6", got[0].GroupID, got[1].GroupID)
+	}
+}
+
+// TestTrackReaderDropsStreamsForUnresolvedAlias verifies that a stream whose
+// alias never resolves is dropped with CancelRead (returning its flow-control
+// credit) rather than leaked, and without blocking the demux loop.
+func TestTrackReaderDropsStreamsForUnresolvedAlias(t *testing.T) {
+	p := &RelayPuller{relay: NewRelay(), log: slog.Default()}
+	aliases := newTrackAliasMap()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	readers := newTrackReaderSet(ctx, p, aliases)
+	readers.waitTimeout = 20 * time.Millisecond
+	defer readers.shutdown()
+
+	cr := &cancelableReader{}
+	readers.dispatch(7, headeredStream{stream: cr})
+
+	eventually(t, 2*time.Second, func() bool {
+		cancelled, _ := cr.state()
+		return cancelled
+	})
 }

@@ -16,6 +16,18 @@ import (
 	webtransport "github.com/quic-go/webtransport-go"
 )
 
+// uniStreamAcceptBuffer bounds how many accepted server uni-streams may sit
+// buffered between the accept pump (AcceptUniStream) and the demux loop that
+// reads their subgroup header, before the pump drops (CancelRead) the overflow.
+// Each buffered entry is just a stream handle — the bytes behind it are bounded
+// by the connection receive window, not this count — so it is sized generously
+// to ride out a reconnect burst where the origin re-opens streams for every
+// subscribed track (10+) plus their initial GOPs faster than the demux loop
+// drains them. At ~50 Mbps across many tracks a shallow buffer turns that burst
+// into dropped GOPs; the demux loop only reads a header per stream so it drains
+// this channel far faster than it fills in steady state.
+const uniStreamAcceptBuffer = 256
+
 // DialConfig holds the parameters for dialing an upstream prism distribution server.
 type DialConfig struct {
 	// ServerAddr is "host:port" of the upstream.
@@ -147,7 +159,7 @@ func Dial(ctx context.Context, cfg DialConfig) (*Conn, error) {
 	// carries a single MoQ subgroup; webtransport-go has already consumed the
 	// uni-stream header (type + session-ID), so each reader starts at the MoQ
 	// subgroup header.
-	dataStreams := make(chan io.Reader, 64)
+	dataStreams := make(chan io.Reader, uniStreamAcceptBuffer)
 	go func() {
 		defer close(dataStreams)
 		var dropped atomic.Int64

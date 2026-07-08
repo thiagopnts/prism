@@ -88,9 +88,16 @@ const (
 	// its track alias to be resolved by a SUBSCRIBE_OK before being dropped.
 	aliasWaitTimeout = 5 * time.Second
 	// trackReaderQueue bounds the per-track backlog of accepted subgroup streams
-	// awaiting their serial reader. On overflow the stream is dropped (a lost
-	// GOP / object) rather than stalling the shared accept loop.
-	trackReaderQueue = 8
+	// awaiting their serial reader. On overflow the stream is dropped (CancelRead,
+	// returning its flow-control credit) rather than stalling the shared demux
+	// loop. It absorbs jitter between the demux loop and a track's serial reader —
+	// including the brief per-connection window where the reader is still waiting
+	// for its alias to resolve — not seconds of media: the connection receive
+	// window is the real byte backstop, and a live relay must not turn into a
+	// multi-second buffer. Sized for comfortable headroom at ~50 Mbps (esp. for
+	// high-object-rate caption / stats tracks and the reconnect burst) while the
+	// reader keeps queue depth near zero in steady state.
+	trackReaderQueue = 32
 )
 
 // NewRelayPuller creates a puller bound to relay. It does not connect; call
@@ -344,8 +351,8 @@ func (p *RelayPuller) runOnce(ctx context.Context) error {
 	ctlErr := make(chan error, 1)
 	go func() { ctlErr <- p.controlLoop(connCtx, sess, pending, aliases) }()
 
-	readers := newTrackReaderSet(connCtx, p)
-	p.acceptStreams(connCtx, conn, aliases, readers)
+	readers := newTrackReaderSet(connCtx, p, aliases)
+	p.acceptStreams(connCtx, conn, readers)
 
 	// Teardown order matters: cancel the control loop, then close the connection
 	// (which resets the accepted uni-streams so the per-track readers unblock
@@ -412,11 +419,17 @@ func (p *RelayPuller) controlLoop(ctx context.Context, sess *moqclient.Session, 
 }
 
 // acceptStreams is the single demux loop: it accepts every server-opened
-// unidirectional stream, reads its subgroup header, resolves the track alias, and
-// hands the stream to that track's serial reader. Centralising alias resolution
-// here (rather than the original per-stream goroutine that dropped streams
-// arriving before the catalog) means no stream is lost to ordering.
-func (p *RelayPuller) acceptStreams(ctx context.Context, conn *moqclient.Conn, aliases *trackAliasMap, readers *trackReaderSet) {
+// unidirectional stream, reads its subgroup header, and hands the stream to the
+// serial reader for its track alias. It deliberately does NOT resolve the alias
+// to a track name here — that would block this shared loop (up to
+// aliasWaitTimeout) on a single not-yet-resolved alias while streams for every
+// already-resolved track pile up undrained, which on a 10+-track feed stalls the
+// whole demux at reconnect. Instead each per-alias reader waits for its own alias
+// (see trackReaderSet.loop), so a slow alias parks only its own reader. Routing
+// by alias (1:1 with a track for the life of a connection) still preserves
+// per-track object ordering: every stream for one alias flows through that one
+// reader's queue in accept order.
+func (p *RelayPuller) acceptStreams(ctx context.Context, conn *moqclient.Conn, readers *trackReaderSet) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -432,13 +445,7 @@ func (p *RelayPuller) acceptStreams(ctx context.Context, conn *moqclient.Conn, a
 				dropStream(stream)
 				continue
 			}
-			name, ok := aliases.waitFor(ctx, hdr.TrackAlias, aliasWaitTimeout)
-			if !ok {
-				p.log.Debug("relay pull: unknown track alias; dropping stream", "alias", hdr.TrackAlias)
-				dropStream(stream)
-				continue
-			}
-			readers.dispatch(name, headeredStream{hdr: hdr, r: r, stream: stream})
+			readers.dispatch(hdr.TrackAlias, headeredStream{hdr: hdr, r: r, stream: stream})
 		}
 	}
 }
@@ -527,37 +534,48 @@ var _ interface {
 	CancelRead(webtransport.StreamErrorCode)
 } = (*webtransport.ReceiveStream)(nil)
 
-// trackReaderSet owns one serial reader goroutine per track for a single
-// connection. Routing each track's subgroup streams to a dedicated goroutine
+// trackReaderSet owns one serial reader goroutine per track alias for a single
+// connection. Routing each alias's subgroup streams to a dedicated goroutine
 // preserves per-track object ordering (so the downstream stream reconstruction is
 // faithful) while still reading different tracks concurrently (no cross-track
-// head-of-line blocking).
+// head-of-line blocking). Keying by alias rather than track name lets the demux
+// loop dispatch a stream before its SUBSCRIBE_OK has resolved the alias to a
+// name: the reader itself waits for the alias (see loop), so alias resolution
+// never blocks the shared demux loop.
 type trackReaderSet struct {
-	p   *RelayPuller
-	ctx context.Context
+	p           *RelayPuller
+	ctx         context.Context
+	aliases     *trackAliasMap
+	waitTimeout time.Duration
 
 	mu      sync.Mutex
-	readers map[string]chan headeredStream
+	readers map[uint64]chan headeredStream
 	wg      sync.WaitGroup
 }
 
-func newTrackReaderSet(ctx context.Context, p *RelayPuller) *trackReaderSet {
-	return &trackReaderSet{p: p, ctx: ctx, readers: make(map[string]chan headeredStream)}
+func newTrackReaderSet(ctx context.Context, p *RelayPuller, aliases *trackAliasMap) *trackReaderSet {
+	return &trackReaderSet{
+		p:           p,
+		ctx:         ctx,
+		aliases:     aliases,
+		waitTimeout: aliasWaitTimeout,
+		readers:     make(map[uint64]chan headeredStream),
+	}
 }
 
-// dispatch hands a stream to its track's reader, lazily starting that reader.
-// Drops the stream if the track's queue is full rather than stalling the shared
-// accept loop.
-func (s *trackReaderSet) dispatch(name string, hs headeredStream) {
+// dispatch hands a stream to its alias's reader, lazily starting that reader.
+// Drops the stream (returning its flow-control credit via CancelRead) if the
+// alias's queue is full rather than stalling the shared demux loop.
+func (s *trackReaderSet) dispatch(alias uint64, hs headeredStream) {
 	s.mu.Lock()
-	ch := s.readers[name]
+	ch := s.readers[alias]
 	if ch == nil {
 		ch = make(chan headeredStream, trackReaderQueue)
-		s.readers[name] = ch
+		s.readers[alias] = ch
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.loop(name, ch)
+			s.loop(alias, ch)
 		}()
 	}
 	s.mu.Unlock()
@@ -565,13 +583,33 @@ func (s *trackReaderSet) dispatch(name string, hs headeredStream) {
 	select {
 	case ch <- hs:
 	default:
-		s.p.log.Debug("relay pull: track reader backpressure; dropping stream", "track", name)
+		s.p.log.Debug("relay pull: track reader backpressure; dropping stream", "alias", alias)
 		dropStream(hs.stream)
 	}
 }
 
-// loop serially reads the streams routed to one track, in accept order.
-func (s *trackReaderSet) loop(name string, in <-chan headeredStream) {
+// loop resolves the alias to a track name (waiting only this goroutine, not the
+// shared demux loop) and then serially reads the streams routed to that alias in
+// accept order. If the alias never resolves within waitTimeout — a stream for a
+// track we never got a SUBSCRIBE_OK for — the reader keeps draining and dropping
+// its queue (CancelRead, returning flow-control credit) rather than letting those
+// streams leak; it exits when the connection tears down.
+func (s *trackReaderSet) loop(alias uint64, in <-chan headeredStream) {
+	name, ok := s.aliases.waitFor(s.ctx, alias, s.waitTimeout)
+	if !ok {
+		s.p.log.Debug("relay pull: unknown track alias; dropping streams", "alias", alias)
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case hs, ok := <-in:
+				if !ok {
+					return
+				}
+				dropStream(hs.stream)
+			}
+		}
+	}
 	for {
 		select {
 		case <-s.ctx.Done():
