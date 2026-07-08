@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	webtransport "github.com/quic-go/webtransport-go"
 	"github.com/zsiec/prism/moq"
 	"github.com/zsiec/prism/moqclient"
 )
@@ -428,14 +429,16 @@ func (p *RelayPuller) acceptStreams(ctx context.Context, conn *moqclient.Conn, a
 			hdr, err := moqclient.ReadSubgroupHeader(r)
 			if err != nil {
 				p.log.Debug("relay pull: subgroup header read failed", "error", err)
+				dropStream(stream)
 				continue
 			}
 			name, ok := aliases.waitFor(ctx, hdr.TrackAlias, aliasWaitTimeout)
 			if !ok {
 				p.log.Debug("relay pull: unknown track alias; dropping stream", "alias", hdr.TrackAlias)
+				dropStream(stream)
 				continue
 			}
-			readers.dispatch(name, headeredStream{hdr: hdr, r: r})
+			readers.dispatch(name, headeredStream{hdr: hdr, r: r, stream: stream})
 		}
 	}
 }
@@ -491,11 +494,38 @@ func replayPolicyForTrack(trackName string) RawReplayPolicy {
 // --- per-track serial readers ---
 
 // headeredStream pairs a subgroup header with the stream reader positioned just
-// past it.
+// past it. stream is the raw underlying uni-stream (the *bufio.Reader wraps it);
+// it is retained so a stream we drop undrained can be released via dropStream.
 type headeredStream struct {
-	hdr moqclient.SubgroupHeader
-	r   *bufio.Reader
+	hdr    moqclient.SubgroupHeader
+	r      *bufio.Reader
+	stream io.Reader
 }
+
+// dropStream releases an accepted upstream uni-stream we are not going to read.
+// quic-go charges a stream's bytes against the connection receive window on
+// arrival and only returns that credit (and retires the MAX_STREAMS slot) when
+// the application reads the stream to completion or cancels it. Silently dropping
+// an accepted-but-undrained stream therefore leaks connection-level flow-control
+// credit for the whole life of the connection, which eventually blocks the
+// origin's writes on MAX_DATA (stalling every track at once). CancelRead sends
+// STOP_SENDING so the stream is retired and its credit reclaimed — mirroring the
+// accept-pump drop in moqclient.Dial.
+func dropStream(r io.Reader) {
+	if c, ok := r.(interface {
+		CancelRead(webtransport.StreamErrorCode)
+	}); ok {
+		c.CancelRead(0)
+	}
+}
+
+// Compile-time guarantee that the concrete upstream uni-stream type satisfies the
+// shape dropStream asserts for. A webtransport API change to CancelRead's
+// signature breaks the build here rather than silently turning dropStream into a
+// no-op.
+var _ interface {
+	CancelRead(webtransport.StreamErrorCode)
+} = (*webtransport.ReceiveStream)(nil)
 
 // trackReaderSet owns one serial reader goroutine per track for a single
 // connection. Routing each track's subgroup streams to a dedicated goroutine
@@ -536,6 +566,7 @@ func (s *trackReaderSet) dispatch(name string, hs headeredStream) {
 	case ch <- hs:
 	default:
 		s.p.log.Debug("relay pull: track reader backpressure; dropping stream", "track", name)
+		dropStream(hs.stream)
 	}
 }
 

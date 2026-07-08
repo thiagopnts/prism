@@ -4,14 +4,39 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"sync"
 	"testing"
 	"time"
 
+	webtransport "github.com/quic-go/webtransport-go"
 	"github.com/zsiec/prism/moq"
 	"github.com/zsiec/prism/moqclient"
 )
+
+// cancelableReader is a fake uni-stream that records CancelRead, matching the
+// method shape dropStream asserts for.
+type cancelableReader struct {
+	cancelled bool
+	code      webtransport.StreamErrorCode
+}
+
+func (c *cancelableReader) Read([]byte) (int, error)                  { return 0, io.EOF }
+func (c *cancelableReader) CancelRead(e webtransport.StreamErrorCode) { c.cancelled = true; c.code = e }
+
+func TestDropStreamCancelsCancelableStream(t *testing.T) {
+	c := &cancelableReader{}
+	dropStream(c)
+	if !c.cancelled {
+		t.Fatal("dropStream did not CancelRead a cancelable stream — its flow-control credit would leak")
+	}
+	if c.code != 0 {
+		t.Errorf("dropStream used error code %d, want 0", c.code)
+	}
+	// A reader without CancelRead must be a safe no-op, not a panic.
+	dropStream(bytes.NewReader([]byte("plain")))
+}
 
 func TestReplayPolicyForTrack(t *testing.T) {
 	cases := map[string]RawReplayPolicy{
