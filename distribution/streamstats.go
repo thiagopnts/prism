@@ -56,6 +56,7 @@ type ViewerStats struct {
 	VideoDropped   int64  `json:"videoDropped"`
 	AudioDropped   int64  `json:"audioDropped"`
 	CaptionDropped int64  `json:"captionDropped"`
+	RawDropped     int64  `json:"rawDropped,omitempty"`
 	BytesSent      int64  `json:"bytesSent"`
 	LastVideoTsMS  int64  `json:"lastVideoTsMs,omitempty"`
 	LastAudioTsMS  int64  `json:"lastAudioTsMs,omitempty"`

@@ -488,7 +488,12 @@ func (m *MoQSession) handleRawSubscribe(ctx context.Context, sub moq.Subscribe, 
 	// registration pushes into rawCh.
 	go m.writeObjectLoop(subCtx, trackSub)
 
-	viewer := &rawObjectViewer{id: m.id, ch: rawCh, dropped: &m.rawDropped}
+	viewer := &rawObjectViewer{
+		id:         m.id,
+		ch:         rawCh,
+		dropped:    &m.rawDropped,
+		gopAligned: replayPolicyForTrack(trackName) == ReplayCurrentGroup,
+	}
 	m.relay.AddRawViewer(trackName, viewer)
 
 	m.mu.Lock()
@@ -572,10 +577,21 @@ func (mx *rawStreamMux) closeCurrent() {
 // rawObjectViewer adapts a track subscription's object channel to the RawViewer
 // interface so a Relay can fan verbatim objects out to it. SendObject must not
 // block (RawViewer contract), so it drops on a full channel.
+//
+// For a GOP-structured track (gopAligned), an overflow drops the rest of the
+// current group rather than one object: a raw relay forwards frames verbatim, so
+// enqueuing a delta whose earlier reference frame was already dropped would
+// orphan it and break the downstream decoder's reference chain (the
+// "discarded N delta frames before key" thrash). StartsStream marks the keyframe
+// that opens the next group's stream, so shedding resumes cleanly there. dropping
+// carries that state; it is only touched from SendObject, which the Relay always
+// calls under rawMu, so it needs no synchronization.
 type rawObjectViewer struct {
-	id      string
-	ch      chan<- RawObject
-	dropped *atomic.Int64
+	id         string
+	ch         chan<- RawObject
+	dropped    *atomic.Int64
+	gopAligned bool
+	dropping   bool
 }
 
 // Compile-time interface check.
@@ -584,10 +600,20 @@ var _ RawViewer = (*rawObjectViewer)(nil)
 func (v *rawObjectViewer) ID() string { return v.id }
 
 func (v *rawObjectViewer) SendObject(obj RawObject) {
+	if v.gopAligned && v.dropping {
+		if !obj.StartsStream {
+			v.dropped.Add(1)
+			return
+		}
+		v.dropping = false
+	}
 	select {
 	case v.ch <- obj:
 	default:
 		v.dropped.Add(1)
+		if v.gopAligned {
+			v.dropping = true
+		}
 	}
 }
 
@@ -719,6 +745,7 @@ func (m *MoQSession) Stats() ViewerStats {
 		VideoDropped:   m.videoDropped.Load(),
 		AudioDropped:   m.audioDropped.Load(),
 		CaptionDropped: m.captionDropped.Load(),
+		RawDropped:     m.rawDropped.Load(),
 		BytesSent:      m.bytesSent.Load(),
 		LastVideoTsMS:  m.lastVideoTsMS.Load(),
 		LastAudioTsMS:  m.lastAudioTsMS.Load(),

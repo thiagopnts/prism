@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -297,4 +298,102 @@ func TestRawSessionRunTeardownReleasesTracks(t *testing.T) {
 		t.Fatalf("raw viewer count = %d after teardown, want 0 (leak)", relay.RawViewerCount("video"))
 	}
 	eventually(t, time.Second, func() bool { return p.unsubCount("video") == 1 })
+}
+
+// drainObjectIDs empties ch and returns the ObjectIDs it held, in order.
+func drainObjectIDs(ch chan RawObject) []uint64 {
+	var ids []uint64
+	for {
+		select {
+		case o := <-ch:
+			ids = append(ids, o.ObjectID)
+		default:
+			return ids
+		}
+	}
+}
+
+// A GOP-aligned viewer that overflows mid-group must shed the rest of that group,
+// not just the object that overflowed: enqueuing a later delta whose reference
+// frame was dropped would orphan it downstream. Shedding resumes at the keyframe
+// (StartsStream) that opens the next group's stream.
+func TestRawObjectViewerGOPAlignedShedsWholeGroup(t *testing.T) {
+	ch := make(chan RawObject, 2)
+	var dropped atomic.Int64
+	v := &rawObjectViewer{id: "v", ch: ch, dropped: &dropped, gopAligned: true}
+
+	// Group 1: keyframe + 3 deltas. Two fit; the object that overflows and every
+	// later delta of the group are dropped.
+	v.SendObject(RawObject{GroupID: 1, ObjectID: 0, StartsStream: true})
+	v.SendObject(RawObject{GroupID: 1, ObjectID: 1})
+	v.SendObject(RawObject{GroupID: 1, ObjectID: 2})
+	v.SendObject(RawObject{GroupID: 1, ObjectID: 3})
+
+	if got := dropped.Load(); got != 2 {
+		t.Fatalf("dropped = %d, want 2 (overflow + rest of group)", got)
+	}
+	if got := drainObjectIDs(ch); len(got) != 2 || got[0] != 0 || got[1] != 1 {
+		t.Fatalf("buffered = %v, want a clean prefix [0 1]", got)
+	}
+
+	// Group 2 keyframe: buffer now drained, so shedding must resume and deliver it.
+	v.SendObject(RawObject{GroupID: 2, ObjectID: 0, StartsStream: true})
+	v.SendObject(RawObject{GroupID: 2, ObjectID: 1})
+	if got := dropped.Load(); got != 2 {
+		t.Fatalf("dropped after resume = %d, want 2 (no new drops)", got)
+	}
+	if got := drainObjectIDs(ch); len(got) != 2 || got[0] != 0 || got[1] != 1 {
+		t.Fatalf("group 2 buffered = %v, want [0 1]", got)
+	}
+}
+
+// While shedding a group, a mid-group delta must not resume delivery even if the
+// buffer has since drained — only a keyframe (StartsStream) does. Otherwise a
+// delta would be delivered without the group's earlier frames.
+func TestRawObjectViewerGOPAlignedResumesOnlyAtKeyframe(t *testing.T) {
+	ch := make(chan RawObject, 2)
+	var dropped atomic.Int64
+	v := &rawObjectViewer{id: "v", ch: ch, dropped: &dropped, gopAligned: true}
+
+	v.SendObject(RawObject{GroupID: 1, ObjectID: 0, StartsStream: true})
+	v.SendObject(RawObject{GroupID: 1, ObjectID: 1})
+	v.SendObject(RawObject{GroupID: 1, ObjectID: 2}) // overflow -> start shedding
+	drainObjectIDs(ch)                               // buffer now has room
+
+	v.SendObject(RawObject{GroupID: 1, ObjectID: 3}) // mid-group: still dropped
+	if got := dropped.Load(); got != 2 {
+		t.Fatalf("dropped = %d, want 2 (mid-group delta not resumed)", got)
+	}
+	if got := drainObjectIDs(ch); len(got) != 0 {
+		t.Fatalf("buffered = %v, want empty (no mid-group resume)", got)
+	}
+
+	v.SendObject(RawObject{GroupID: 2, ObjectID: 0, StartsStream: true})
+	if got := drainObjectIDs(ch); len(got) != 1 || got[0] != 0 {
+		t.Fatalf("buffered = %v, want [0] (resumed at keyframe)", got)
+	}
+}
+
+// A non-GOP-aligned viewer (audio's single boundary-less stream, stats) keeps the
+// plain drop-one behavior: an overflow drops just that object and delivery
+// resumes immediately, since each object is independently decodable.
+func TestRawObjectViewerNonAlignedDropsSingleObject(t *testing.T) {
+	ch := make(chan RawObject, 1)
+	var dropped atomic.Int64
+	v := &rawObjectViewer{id: "v", ch: ch, dropped: &dropped, gopAligned: false}
+
+	v.SendObject(RawObject{ObjectID: 0}) // fills buffer
+	v.SendObject(RawObject{ObjectID: 1}) // overflow -> dropped
+	if got := dropped.Load(); got != 1 {
+		t.Fatalf("dropped = %d, want 1", got)
+	}
+
+	<-ch                                 // make room
+	v.SendObject(RawObject{ObjectID: 2}) // delivered immediately (no sticky shedding)
+	if got := dropped.Load(); got != 1 {
+		t.Fatalf("dropped = %d, want 1 (no extra drop)", got)
+	}
+	if got := drainObjectIDs(ch); len(got) != 1 || got[0] != 2 {
+		t.Fatalf("buffered = %v, want [2]", got)
+	}
 }
