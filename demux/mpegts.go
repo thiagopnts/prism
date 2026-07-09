@@ -442,7 +442,12 @@ func (d *Demuxer) buildAndEmitFrame(ctx context.Context, isKeyframe bool, naluBy
 }
 
 func (d *Demuxer) handleCaptionSEI(ctx context.Context, seiData []byte, pts int64) {
-	cd := ccx.ExtractCaptions(seiData)
+	var cd *ccx.CaptionData
+	if d.isHEVC {
+		cd = ccx.ExtractCaptionsHEVC(seiData)
+	} else {
+		cd = ccx.ExtractCaptions(seiData)
+	}
 	if cd == nil {
 		return
 	}
