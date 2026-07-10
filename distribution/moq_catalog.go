@@ -116,7 +116,7 @@ func buildMoQCatalog(streamKey string, relay *Relay, controlEnabled bool) ([]byt
 // writeCatalogObject opens a uni-stream and writes the catalog as a single
 // MoQ object (subgroup header + object with payload).
 func writeCatalogObject(ctx context.Context, session *webtransport.Session, catalogAlias uint64, catalogJSON []byte) error {
-	stream, err := session.OpenUniStreamSync(ctx)
+	stream, err := openWatchedStream(ctx, session)
 	if err != nil {
 		return fmt.Errorf("open catalog stream: %w", err)
 	}

@@ -512,7 +512,7 @@ func (m *MoQSession) writeObjectLoop(ctx context.Context, sub *moqTrackSub) {
 	mx := &rawStreamMux{
 		w: NewRawStreamWriter(sub.trackAlias),
 		open: func() (io.WriteCloser, error) {
-			s, err := m.session.OpenUniStreamSync(ctx)
+			s, err := openWatchedStream(ctx, m.session)
 			if err != nil {
 				return nil, err
 			}
@@ -754,8 +754,43 @@ func (m *MoQSession) Stats() ViewerStats {
 
 // --- Write loops ---
 
+// watchedStream wraps a WebTransport send stream whose write side is tied to a
+// context. webtransport's SendStream.Write can park inside handleSessionGoneError
+// after the peer resets the stream with WTSessionGoneErrorCode (a graceful session
+// close), waiting on the session-level close. That wait observes neither the write
+// loop's context nor SendStream.Close/CancelWrite — only a write deadline frees it.
+// When the peer's per-stream reset wins the race against the session close, the
+// write loop would otherwise leak its goroutine and stream for the life of the
+// process. A cancelled context forces a past write deadline so an in-flight Write
+// returns and the loop unwinds on teardown.
+type watchedStream struct {
+	*webtransport.SendStream
+	stopWatch func() bool
+}
+
+// Close cancels the deadline watcher and closes the underlying stream.
+func (w *watchedStream) Close() error {
+	w.stopWatch()
+	return w.SendStream.Close()
+}
+
+// openWatchedStream opens a unidirectional stream and registers a context-driven
+// write-deadline watcher (see watchedStream). Callers must Close the returned
+// stream — which the write loops already do on every exit path — to release the
+// watcher registration.
+func openWatchedStream(ctx context.Context, session *webtransport.Session) (*watchedStream, error) {
+	stream, err := session.OpenUniStreamSync(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stop := context.AfterFunc(ctx, func() {
+		_ = stream.SetWriteDeadline(time.Now())
+	})
+	return &watchedStream{SendStream: stream, stopWatch: stop}, nil
+}
+
 func (m *MoQSession) writeVideoLoop(ctx context.Context, sub *moqTrackSub) {
-	var currentStream *webtransport.SendStream
+	var currentStream *watchedStream
 	var currentGroupID uint32
 
 	closeStream := func() {
@@ -780,7 +815,7 @@ func (m *MoQSession) writeVideoLoop(ctx context.Context, sub *moqTrackSub) {
 				currentGroupID = frame.GroupID
 
 				t0 := time.Now()
-				stream, err := m.session.OpenUniStreamSync(ctx)
+				stream, err := openWatchedStream(ctx, m.session)
 				if openDur := time.Since(t0); openDur > 50*time.Millisecond {
 					m.log.Warn("video stream open slow",
 						"duration_ms", openDur.Milliseconds(),
@@ -825,7 +860,7 @@ func (m *MoQSession) writeVideoLoop(ctx context.Context, sub *moqTrackSub) {
 }
 
 func (m *MoQSession) writeAudioLoop(ctx context.Context, sub *moqTrackSub) {
-	var stream *webtransport.SendStream
+	var stream *watchedStream
 	defer func() {
 		if stream != nil {
 			stream.Close()
@@ -843,7 +878,7 @@ func (m *MoQSession) writeAudioLoop(ctx context.Context, sub *moqTrackSub) {
 
 			if stream == nil {
 				var err error
-				stream, err = m.session.OpenUniStreamSync(ctx)
+				stream, err = openWatchedStream(ctx, m.session)
 				if err != nil {
 					m.log.Debug("audio stream open failed", "error", err)
 					return
@@ -883,7 +918,7 @@ func (m *MoQSession) writeCaptionLoop(ctx context.Context, sub *moqTrackSub) {
 				return
 			}
 
-			stream, err := m.session.OpenUniStreamSync(ctx)
+			stream, err := openWatchedStream(ctx, m.session)
 			if err != nil {
 				m.log.Debug("caption stream open failed", "error", err)
 				return
@@ -971,7 +1006,7 @@ func (m *MoQSession) writeStatsLoop(ctx context.Context, sub *moqTrackSub) {
 				continue
 			}
 
-			stream, err := m.session.OpenUniStreamSync(ctx)
+			stream, err := openWatchedStream(ctx, m.session)
 			if err != nil {
 				m.log.Debug("stats stream open failed", "error", err)
 				return
@@ -1055,7 +1090,7 @@ func (m *MoQSession) writeControlLoop(ctx context.Context, sub *moqTrackSub, ch 
 				return
 			}
 
-			stream, err := m.session.OpenUniStreamSync(ctx)
+			stream, err := openWatchedStream(ctx, m.session)
 			if err != nil {
 				m.log.Debug("control stream open failed", "error", err)
 				return

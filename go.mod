@@ -4,6 +4,8 @@ go 1.24.3
 
 replace github.com/quic-go/quic-go => github.com/zsiec/quic-go v0.59.1-bbr
 
+replace github.com/zsiec/ccx => /Users/thiago/src/ccx-thiagopnts
+
 require (
 	github.com/quic-go/quic-go v0.59.0
 	github.com/quic-go/webtransport-go v0.10.0
