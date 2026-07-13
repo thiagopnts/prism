@@ -86,6 +86,14 @@ func (s *Server) handleConnection(ctx context.Context, conn *srtgo.Conn, streamK
 	defer conn.Close()
 
 	stream, writer := s.registry.Register(streamKey, ingest.FormatMPEGTS)
+	// Close this connection's pipe writer when the connection ends so the
+	// pipeline reading the other end always gets EOF and tears down. Unregister
+	// closes the writer keyed by streamKey, but a later same-key Register
+	// overwrites that entry, so on a duplicate/reconnect the keyed close would
+	// hit the wrong writer and leak this one (wedging a downstream feed forever).
+	if wc, ok := writer.(io.Closer); ok {
+		defer wc.Close()
+	}
 	stream.SetRemoteAddr(conn.RemoteAddr().String())
 
 	buf := make([]byte, srtReadBufferSize)
