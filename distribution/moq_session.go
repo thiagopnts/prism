@@ -332,7 +332,7 @@ func (m *MoQSession) handleSubscribe(ctx context.Context, sub moq.Subscribe) {
 	// catalog is served the same way for both (handleCatalogSubscribe already
 	// prefers the verbatim upstream catalog), so it is left to the switch below.
 	if trackName != "catalog" && m.relay.isRelayed() {
-		if isRelayableTrack(trackName) {
+		if isRelayableTrack(trackName) || m.relay.HasRawTrack(trackName) {
 			m.handleRawSubscribe(ctx, sub, alias, trackName)
 		} else {
 			m.sendSubscribeError(sub.RequestID, http.StatusNotFound, moq.ErrUnknownTrack.Error())

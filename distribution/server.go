@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -191,6 +192,12 @@ type ServerConfig struct {
 	// (512 KB stream / 768 KB connection) are too small for sustained
 	// video bitrates and cause server-side write blocking.
 	QUICConfig *quic.Config
+
+	// ExternalUpstreamResolver resolves an `external=` query key (an extra feed
+	// to merge into the stream a viewer requests) to the prism host it must be
+	// pulled from. Returns ok=false for an unknown key, which fails that viewer's
+	// connection cleanly. When nil, any `external=` request is rejected.
+	ExternalUpstreamResolver func(externalKey string) (UpstreamConfig, bool)
 }
 
 // streamResources bundles the relay and stats provider for a single live
@@ -214,8 +221,28 @@ type Server struct {
 
 	mu      sync.RWMutex
 	streams map[string]*streamResources
+	// externalRelays holds a shared relayed puller per `external=` feed key, kept
+	// separate from streams so an external key can never collide with a real
+	// stream key. Built lazily by resolveExternalRelayLocked; reused across every
+	// merge relay that references the key.
+	externalRelays map[string]*streamResources
+	// mergeRelays holds one synthetic merge relay per (anchor stream + sorted
+	// external set), keyed by an internal cache key that never appears on the wire.
+	// Reused when the same combination is requested again; swept when the anchor
+	// stream is unregistered.
+	mergeRelays map[string]*mergeResources
 
 	controlBroadcaster *ControlBroadcaster // nil if ControlCh not configured
+}
+
+// mergeResources bundles a synthetic merge relay with its MergePuller and the
+// cancel for its upstream parent context, plus the anchor stream key so the
+// unregister sweep can tear it down when the anchor goes away.
+type mergeResources struct {
+	relay          *Relay
+	puller         *MergePuller
+	anchorKey      string
+	upstreamCancel context.CancelFunc
 }
 
 // NewServer creates a distribution Server with the given configuration.
@@ -228,8 +255,10 @@ func NewServer(config ServerConfig) (*Server, error) {
 		return nil, errors.New("distribution: Addr is required")
 	}
 	s := &Server{
-		config:  config,
-		streams: make(map[string]*streamResources),
+		config:         config,
+		streams:        make(map[string]*streamResources),
+		externalRelays: make(map[string]*streamResources),
+		mergeRelays:    make(map[string]*mergeResources),
 	}
 	if config.ControlCh != nil {
 		s.controlBroadcaster = NewControlBroadcaster()
@@ -350,6 +379,124 @@ func (s *Server) SetRelayedUpstream(streamKey, addr string, certHashes []string)
 	return sr.puller.SetUpstream(addr, certHashes)
 }
 
+// resolveExternalRelayLocked returns the shared relayed relay for an `external=`
+// feed key, building it lazily via ExternalUpstreamResolver on first use. Like
+// RegisterRelayedUpstream it is pure bookkeeping — no connection is opened until a
+// MergePuller calls EnsureUpstream on the returned relay. Caller holds s.mu.
+func (s *Server) resolveExternalRelayLocked(externalKey string) (*Relay, error) {
+	if sr, ok := s.externalRelays[externalKey]; ok {
+		return sr.relay, nil
+	}
+	if s.config.ExternalUpstreamResolver == nil {
+		return nil, fmt.Errorf("external feed resolver not configured")
+	}
+	cfg, ok := s.config.ExternalUpstreamResolver(externalKey)
+	if !ok {
+		return nil, fmt.Errorf("unknown external feed %q", externalKey)
+	}
+	if cfg.StreamKey == "" {
+		cfg.StreamKey = externalKey
+	}
+	r := NewRelay()
+	upCtx, upCancel := context.WithCancel(context.Background())
+	puller := NewRelayPuller(r, cfg)
+	r.attachPuller(puller, upCtx)
+	s.externalRelays[externalKey] = &streamResources{relay: r, puller: puller, upstreamCancel: upCancel}
+	return r, nil
+}
+
+// resolveMergeRelay returns the synthetic merge relay for the given anchor stream
+// plus external feed set, building it on first request and reusing it for any
+// later request with the same (anchor, sorted-externals) combination. The returned
+// relay reports the plain anchor stream key on the wire (its merged catalog's
+// namespace is the anchor key), so an unmodified consumer subscribes every merged
+// track under the one namespace it knows; the cache key is internal only.
+//
+// The whole call runs under s.mu: construction is synchronous bookkeeping (no I/O
+// — the taps dial lazily when the first viewer's EnsureUpstream starts the
+// MergePuller), so holding the lock cannot block on the network.
+//
+// The anchor relay is re-fetched from s.streams here rather than trusting a
+// pointer resolved earlier: setupMoQ resolves the anchor before a network
+// handshake, and the anchor can be unregistered (and its merge relays swept) in
+// that window. Building the entry only while the anchor is present in s.streams
+// guarantees a later unregister sweep covers it (closing the sweep-then-insert
+// TOCTOU) and binds the merge to the currently-live anchor relay.
+func (s *Server) resolveMergeRelay(anchorKey string, externalKeys []string) (*Relay, error) {
+	sorted := append([]string(nil), externalKeys...)
+	slices.Sort(sorted)
+	sorted = slices.Compact(sorted)
+	cacheKey := anchorKey + "\x00" + strings.Join(sorted, "\x00")
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if mr, ok := s.mergeRelays[cacheKey]; ok {
+		return mr.relay, nil
+	}
+
+	sr, ok := s.streams[anchorKey]
+	if !ok {
+		return nil, fmt.Errorf("anchor stream %q not found", anchorKey)
+	}
+	anchor := sr.relay
+
+	externals := make([]mergeExternal, 0, len(sorted))
+	for _, k := range sorted {
+		er, err := s.resolveExternalRelayLocked(k)
+		if err != nil {
+			return nil, err
+		}
+		externals = append(externals, mergeExternal{key: k, relay: er})
+	}
+
+	mergeRelay := NewRelay()
+	upCtx, upCancel := context.WithCancel(context.Background())
+	mp := NewMergePuller(mergeRelay, cacheKey, anchorKey, anchor, externals)
+	mergeRelay.attachPuller(mp, upCtx)
+	s.mergeRelays[cacheKey] = &mergeResources{
+		relay:          mergeRelay,
+		puller:         mp,
+		anchorKey:      anchorKey,
+		upstreamCancel: upCancel,
+	}
+	return mergeRelay, nil
+}
+
+// RefreshExternalUpstreams re-resolves every shared external relay's upstream via
+// ExternalUpstreamResolver and applies any change to its puller. External feeds
+// are pulled from a cluster whose addr / QUIC cert hashes are discovered out of
+// band (e.g. polling that cluster's cert-hash endpoint) and can rotate; call this
+// after such a poll observes a change so live external pulls pick up the new addr
+// or cert hashes instead of failing TLS on their next reconnect. Each SetUpstream
+// is a no-op when nothing changed, so calling this on a fixed schedule is cheap.
+func (s *Server) RefreshExternalUpstreams() {
+	if s.config.ExternalUpstreamResolver == nil {
+		return
+	}
+	type ext struct {
+		key    string
+		puller *RelayPuller
+	}
+	s.mu.RLock()
+	exts := make([]ext, 0, len(s.externalRelays))
+	for k, sr := range s.externalRelays {
+		if sr.puller != nil {
+			exts = append(exts, ext{key: k, puller: sr.puller})
+		}
+	}
+	s.mu.RUnlock()
+
+	// Resolve + SetUpstream outside s.mu: the resolver is a cheap cached read and
+	// SetUpstream takes only the puller's own lock (s.mu → puller.mu is never
+	// nested, matching SetRelayedUpstream).
+	for _, e := range exts {
+		if cfg, ok := s.config.ExternalUpstreamResolver(e.key); ok {
+			e.puller.SetUpstream(cfg.Addr, cfg.CertHashes)
+		}
+	}
+}
+
 // UnregisterStream removes the relay and pipeline for a stream key.
 // If the stream existed, OnStreamUnregistered is called (if set) after
 // releasing the lock. If a concurrent RegisterStream for the same key
@@ -377,7 +524,23 @@ func (s *Server) unregister(streamKey string) {
 	s.mu.Lock()
 	sr, existed := s.streams[streamKey]
 	delete(s.streams, streamKey)
+	// Sweep any merge relays anchored on this stream: they synthesize their
+	// catalog from the anchor and are meaningless once it is gone.
+	var mergeEvicted []*mergeResources
+	for ck, mr := range s.mergeRelays {
+		if mr.anchorKey == streamKey {
+			mergeEvicted = append(mergeEvicted, mr)
+			delete(s.mergeRelays, ck)
+		}
+	}
 	s.mu.Unlock()
+
+	for _, mr := range mergeEvicted {
+		if mr.upstreamCancel != nil {
+			mr.upstreamCancel()
+		}
+		mr.relay.shutdownUpstream()
+	}
 
 	if !existed {
 		return
@@ -658,6 +821,21 @@ func (s *Server) setupMoQ(r *http.Request, session *webtransport.Session, contro
 		slog.Warn("moq no stream key provided")
 		session.CloseWithError(wtErrBadRequest, "missing stream key")
 		return "", nil, nil, fmt.Errorf("moq: missing stream key")
+	}
+
+	// Extra `external=` feeds merge into the stream this viewer requested: swap
+	// the anchor relay for a shared merge relay that re-serves the anchor's tracks
+	// plus one per external, all under the anchor's (unchanged) stream key. With no
+	// externals the path is untouched — the viewer gets the anchor relay directly.
+	if externals := r.URL.Query()["external"]; len(externals) > 0 {
+		merged, err := s.resolveMergeRelay(streamKey, externals)
+		if err != nil {
+			slog.Warn("moq merge relay setup failed", "stream", streamKey, "error", err)
+			session.CloseWithError(wtErrStreamNotFound, "merge stream unavailable")
+			return "", nil, nil, err
+		}
+		relay = merged
+		moqSession.relay = merged
 	}
 
 	return streamKey, relay, moqSession, nil

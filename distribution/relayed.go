@@ -211,6 +211,15 @@ func (r *Relay) RawViewerCount(trackKey string) int {
 	return 0
 }
 
+// HasRawTrack reports whether trackKey has been registered as a raw track
+// (via EnsureRawTrack), regardless of whether it currently has any viewers.
+func (r *Relay) HasRawTrack(trackKey string) bool {
+	r.rawMu.RLock()
+	defer r.rawMu.RUnlock()
+	_, ok := r.rawTracks[trackKey]
+	return ok
+}
+
 // defaultTrackGrace is how long a track stays subscribed upstream after its last
 // downstream viewer leaves, so a viewer who flips away and back (or reconnects)
 // does not force an unsubscribe/resubscribe round trip.
