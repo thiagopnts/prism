@@ -20,8 +20,9 @@ const (
 
 // LOC header extension IDs (draft-ietf-moq-loc-01).
 const (
-	locExtCaptureTimestamp  uint64 = 2  // even: varint value = microseconds
+	locExtCaptureTimestamp  uint64 = 2  // even: varint value = microseconds (media clock)
 	locExtVideoFrameMarking uint64 = 4  // even: varint value = RFC 9626 flags
+	locExtCaptureWallClock  uint64 = 8  // even: varint value = UTC µs from embedded timecode (0/absent = none)
 	locExtVideoConfig       uint64 = 13 // odd: length-prefixed byte string
 )
 
@@ -85,6 +86,14 @@ func (m *moqWriter) WriteVideoFrame(w io.Writer, frame *media.VideoFrame) (int64
 		exts = quicvarint.Append(exts, vfmKeyframe)
 	} else {
 		exts = quicvarint.Append(exts, vfmNonKeyframe)
+	}
+
+	// Capture Wall Clock (ID 8, even → varint value): the frame's real capture time
+	// in UTC microseconds, reconstructed from an embedded SMPTE timecode. Emitted
+	// only when known so streams without a timecode stay byte-identical to before.
+	if frame.CaptureWallUS > 0 {
+		exts = quicvarint.Append(exts, locExtCaptureWallClock)
+		exts = quicvarint.Append(exts, uint64(frame.CaptureWallUS))
 	}
 
 	// Video Config on keyframes (ID 13, odd → length-prefixed bytes)

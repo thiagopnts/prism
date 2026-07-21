@@ -2,7 +2,42 @@ package demux
 
 import (
 	"testing"
+	"time"
 )
+
+func TestTimecodeWallUS(t *testing.T) {
+	t.Parallel()
+	// Reference observing instant: 2026-07-17 14:00:07.400 UTC.
+	ref := time.Date(2026, 7, 17, 14, 0, 7, 400_000_000, time.UTC)
+
+	// A timecode matching the reference time-of-day maps onto ref's UTC day.
+	tc := Timecode{Hours: 14, Minutes: 0, Seconds: 7, Frames: 12}
+	got := tc.WallUS(30, ref)
+	want := time.Date(2026, 7, 17, 14, 0, 7, 0, time.UTC).UnixMicro() + int64(float64(12)/30*1_000_000)
+	if got != want {
+		t.Fatalf("WallUS = %d, want %d", got, want)
+	}
+
+	// fps<=0 drops the sub-second Frames term (whole-second precision).
+	if got := tc.WallUS(0, ref); got != time.Date(2026, 7, 17, 14, 0, 7, 0, time.UTC).UnixMicro() {
+		t.Fatalf("WallUS(fps=0) = %d, want whole-second", got)
+	}
+
+	// Timecode near 23:59 observed just after UTC midnight belongs to the PREVIOUS
+	// day (rollover clamp), not ref's day.
+	refMidnight := time.Date(2026, 7, 17, 0, 0, 3, 0, time.UTC)
+	tcLate := Timecode{Hours: 23, Minutes: 59, Seconds: 59}
+	gotLate := tcLate.WallUS(0, refMidnight)
+	wantLate := time.Date(2026, 7, 16, 23, 59, 59, 0, time.UTC).UnixMicro()
+	if gotLate != wantLate {
+		t.Fatalf("WallUS(rollover) = %d, want %d (previous day)", gotLate, wantLate)
+	}
+
+	// Out-of-range time-of-day → 0 (no usable wall clock).
+	if got := (Timecode{Hours: 25}).WallUS(30, ref); got != 0 {
+		t.Fatalf("WallUS(invalid) = %d, want 0", got)
+	}
+}
 
 func TestParseAnnexB(t *testing.T) {
 	t.Parallel()

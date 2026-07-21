@@ -38,6 +38,7 @@ type StatsRecorder interface {
 	RecordTimecode(tc string)
 	RecordSCTE35(event SCTE35Event)
 	RecordVideoCodec(codec string)
+	VideoFPS() float64
 }
 
 // SCTE35Event represents a parsed SCTE-35 splice information event extracted
@@ -306,6 +307,7 @@ func (d *Demuxer) handleVideoH264(ctx context.Context, data []byte, pts, dts int
 
 	isKeyframe := false
 	var naluBytes [][]byte
+	var captureWallUS int64
 
 	for _, nalu := range nalus {
 		// Skip AUD and filler data NALUs — unnecessary for clients.
@@ -331,9 +333,12 @@ func (d *Demuxer) handleVideoH264(ctx context.Context, data []byte, pts, dts int
 		case IsKeyframe(nalu.Type):
 			isKeyframe = true
 		case nalu.Type == NALTypeSEI:
-			if d.stats != nil && d.spsInfo.PicStructPresent {
+			if d.spsInfo.PicStructPresent {
 				if tc, ok := ParsePicTimingSEI(nalu.Data, d.spsInfo); ok {
-					d.stats.RecordTimecode(tc.String())
+					if d.stats != nil {
+						d.stats.RecordTimecode(tc.String())
+					}
+					captureWallUS = tc.WallUS(d.videoFPS(), time.Now())
 				}
 			}
 
@@ -349,7 +354,7 @@ func (d *Demuxer) handleVideoH264(ctx context.Context, data []byte, pts, dts int
 		naluBytes = append(naluBytes, annexB)
 	}
 
-	d.buildAndEmitFrame(ctx, isKeyframe, naluBytes, "h264", pts, dts)
+	d.buildAndEmitFrame(ctx, isKeyframe, naluBytes, "h264", pts, dts, captureWallUS)
 }
 
 func (d *Demuxer) handleVideoHEVC(ctx context.Context, data []byte, pts, dts int64) {
@@ -360,6 +365,7 @@ func (d *Demuxer) handleVideoHEVC(ctx context.Context, data []byte, pts, dts int
 
 	isKeyframe := false
 	var naluBytes [][]byte
+	var captureWallUS int64
 
 	for _, nalu := range nalus {
 		// Skip AUD and filler data NALUs — unnecessary for clients.
@@ -394,6 +400,7 @@ func (d *Demuxer) handleVideoHEVC(ctx context.Context, data []byte, pts, dts int
 					if d.stats != nil {
 						d.stats.RecordTimecode(tc.String())
 					}
+					captureWallUS = tc.WallUS(d.videoFPS(), time.Now())
 				}
 				d.handleCaptionSEI(ctx, nalu.Data, pts)
 			}
@@ -408,21 +415,32 @@ func (d *Demuxer) handleVideoHEVC(ctx context.Context, data []byte, pts, dts int
 		naluBytes = append(naluBytes, annexB)
 	}
 
-	d.buildAndEmitFrame(ctx, isKeyframe, naluBytes, "h265", pts, dts)
+	d.buildAndEmitFrame(ctx, isKeyframe, naluBytes, "h265", pts, dts, captureWallUS)
 }
 
-func (d *Demuxer) buildAndEmitFrame(ctx context.Context, isKeyframe bool, naluBytes [][]byte, codec string, pts, dts int64) {
+// videoFPS returns the current measured video frame rate, or 0 when no stats
+// recorder is attached (in which case the timecode's sub-second Frames field is
+// dropped, leaving whole-second capture-time precision).
+func (d *Demuxer) videoFPS() float64 {
+	if d.stats == nil {
+		return 0
+	}
+	return d.stats.VideoFPS()
+}
+
+func (d *Demuxer) buildAndEmitFrame(ctx context.Context, isKeyframe bool, naluBytes [][]byte, codec string, pts, dts, captureWallUS int64) {
 	if isKeyframe {
 		d.groupID++
 	}
 
 	frame := &media.VideoFrame{
-		PTS:        pts,
-		DTS:        dts,
-		IsKeyframe: isKeyframe,
-		NALUs:      naluBytes,
-		Codec:      codec,
-		GroupID:    d.groupID,
+		PTS:           pts,
+		DTS:           dts,
+		IsKeyframe:    isKeyframe,
+		NALUs:         naluBytes,
+		Codec:         codec,
+		GroupID:       d.groupID,
+		CaptureWallUS: captureWallUS,
 	}
 
 	if d.sps != nil {

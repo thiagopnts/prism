@@ -25,10 +25,14 @@ const mergeSetupTimeout = 15 * time.Second
 // yet ready (mirrors RelayPuller's reconnect backoff: 1s → mergeMaxBackoff).
 const mergeMaxBackoff = 30 * time.Second
 
-// mergeExternal binds an external feed key to the relay it is pulled through.
+// mergeExternal binds an external feed key to its source. Exactly one of relay
+// (the MoQ path — an upstream relay tapped for a verbatim track) or virtual (the
+// virtual path — a caller-assembled source whose frames prism paces against the
+// anchor) is set.
 type mergeExternal struct {
-	key   string
-	relay *Relay
+	key     string
+	relay   *Relay
+	virtual VirtualExternalSource
 }
 
 // resolvedExternalTrack is the single media track discovered in an external
@@ -70,6 +74,12 @@ type MergePuller struct {
 	// when the anchor is itself relayed (its raw tracks are tapped directly).
 	tap *originAnchorTap
 
+	// anchorClock tracks the anchor's latest capture timestamp so virtual sources
+	// can map their own timeline into the anchor timebase and the pacer can release
+	// due frames. Updated from whichever anchor path is active (origin tap's
+	// SendVideo or the relayed anchor's video forwarder).
+	anchorClock *anchorClock
+
 	mu      sync.Mutex
 	started bool
 	cancel  context.CancelFunc
@@ -89,17 +99,19 @@ var _ upstreamPuller = (*MergePuller)(nil)
 // not collide in that source's viewer maps.
 func NewMergePuller(merge *Relay, id, anchorKey string, anchor *Relay, externals []mergeExternal) *MergePuller {
 	mp := &MergePuller{
-		merge:     merge,
-		id:        id,
-		anchorKey: anchorKey,
-		anchor:    anchor,
-		externals: externals,
-		log:       slog.With("component", "merge_puller", "anchor", anchorKey),
+		merge:       merge,
+		id:          id,
+		anchorKey:   anchorKey,
+		anchor:      anchor,
+		externals:   externals,
+		anchorClock: &anchorClock{},
+		log:         slog.With("component", "merge_puller", "anchor", anchorKey),
 	}
 	mp.tap = &originAnchorTap{
-		id:    id + ":anchortap",
-		merge: merge,
-		audio: make(map[int]*audioCounter),
+		id:     id + ":anchortap",
+		merge:  merge,
+		audio:  make(map[int]*audioCounter),
+		anchor: mp.anchorClock,
 	}
 	return mp
 }
@@ -197,6 +209,8 @@ func (mp *MergePuller) attempt(ctx context.Context) bool {
 		relay       *Relay
 		sourceName  string // "" until the media track is acquired
 		forwarderID string
+		virtual     VirtualExternalSource // set for a virtual (non-MoQ) external
+		pacerCancel context.CancelFunc    // cancels the virtual source + its pacer
 	}
 	var (
 		anchorUpstreamHeld bool
@@ -209,6 +223,15 @@ func (mp *MergePuller) attempt(ctx context.Context) bool {
 	defer func() {
 		for i := len(extHolds) - 1; i >= 0; i-- {
 			h := extHolds[i]
+			if h.virtual != nil {
+				// Virtual external: stop the source and its pacer. There is no
+				// upstream relay to release.
+				h.virtual.Stop()
+				if h.pacerCancel != nil {
+					h.pacerCancel()
+				}
+				continue
+			}
 			if h.sourceName != "" {
 				h.relay.ReleaseTrack(h.sourceName)
 				h.relay.RemoveRawViewer(h.sourceName, h.forwarderID)
@@ -269,6 +292,24 @@ func (mp *MergePuller) attempt(ctx context.Context) bool {
 		if ctx.Err() != nil {
 			return false
 		}
+
+		// --- virtual external: caller-assembled source, no upstream pull ---
+		if e.virtual != nil {
+			src := e.virtual
+			name := src.TrackName()
+			mp.merge.EnsureRawTrack(name, ReplayCurrentGroup)
+			pacer := newVirtualPacer(mp.merge, name, mp.anchorClock, mp.log)
+			pctx, pcancel := context.WithCancel(ctx)
+			go pacer.run(pctx)
+			src.Start(pctx, pacer, mp.anchorClock)
+			extHolds = append(extHolds, extHold{virtual: src, pacerCancel: pcancel})
+			resolved = append(resolved, resolvedExternalTrack{
+				key:             name,
+				selectionParams: src.SelectionParams(),
+			})
+			continue
+		}
+
 		e.relay.EnsureUpstream()
 		extHolds = append(extHolds, extHold{relay: e.relay})
 		hi := len(extHolds) - 1
@@ -308,8 +349,14 @@ func (mp *MergePuller) attempt(ctx context.Context) bool {
 		for _, name := range relayableTrackNames(anchorCatalogJSON) {
 			mp.merge.EnsureRawTrack(name, replayPolicyForTrack(name))
 			fwID := mp.forwarderID(name)
+			fw := &rawForwarder{id: fwID, target: name, merge: mp.merge}
+			if name == "video" {
+				// The video track carries the anchor's capture timestamps; tap them
+				// to drive the anchor clock for virtual-source pacing.
+				fw.anchor = mp.anchorClock
+			}
 			mp.anchor.AcquireTrack(name)
-			mp.anchor.AddRawViewer(name, &rawForwarder{id: fwID, target: name, merge: mp.merge})
+			mp.anchor.AddRawViewer(name, fw)
 			anchorTracks = append(anchorTracks, name)
 			anchorForwarders[name] = fwID
 		}
@@ -409,12 +456,25 @@ type rawForwarder struct {
 	id     string
 	target string
 	merge  *Relay
+
+	// anchor, when set, is updated with each forwarded object's LOC capture
+	// timestamp. Set only on a relayed anchor's video forwarder so virtual
+	// sources/pacers can align to the anchor timeline (the origin path uses
+	// originAnchorTap instead).
+	anchor *anchorClock
 }
 
 var _ RawViewer = (*rawForwarder)(nil)
 
-func (f *rawForwarder) ID() string               { return f.id }
-func (f *rawForwarder) SendObject(obj RawObject) { f.merge.BroadcastObject(f.target, obj) }
+func (f *rawForwarder) ID() string { return f.id }
+func (f *rawForwarder) SendObject(obj RawObject) {
+	if f.anchor != nil {
+		if ts, ok, wallUS, _ := anchorTimingFromExt(obj.ExtBytes); ok {
+			f.anchor.update(ts, wallUS)
+		}
+	}
+	f.merge.BroadcastObject(f.target, obj)
+}
 
 // audioCounter tracks per-audio-track object numbering for the origin tap.
 type audioCounter struct {
@@ -434,6 +494,10 @@ type audioCounter struct {
 type originAnchorTap struct {
 	id    string
 	merge *Relay
+
+	// anchor, when set, receives each video frame's PTS as the anchor's latest
+	// capture timestamp so virtual sources/pacers can align to the anchor timeline.
+	anchor *anchorClock
 
 	// mu serialises counter updates with the BroadcastObject they gate so
 	// per-track object ordering holds even if the anchor broadcasts media types
@@ -472,6 +536,10 @@ func (t *originAnchorTap) SendVideo(frame *media.VideoFrame) {
 		payload = moq.AnnexBToAVC1(frame.NALUs)
 	}
 	exts := buildVideoExts(frame)
+
+	if t.anchor != nil {
+		t.anchor.update(frame.PTS, frame.CaptureWallUS)
+	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -559,6 +627,13 @@ func buildVideoExts(frame *media.VideoFrame) []byte {
 		exts = quicvarint.Append(exts, vfmKeyframe)
 	} else {
 		exts = quicvarint.Append(exts, vfmNonKeyframe)
+	}
+
+	// Capture Wall Clock (ID 8): see moqWriter.WriteVideoFrame. Emitted only when
+	// known so the forwarded object stays byte-identical to the origin write path.
+	if frame.CaptureWallUS > 0 {
+		exts = quicvarint.Append(exts, locExtCaptureWallClock)
+		exts = quicvarint.Append(exts, uint64(frame.CaptureWallUS))
 	}
 
 	if frame.IsKeyframe && frame.SPS != nil && frame.PPS != nil {

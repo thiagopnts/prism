@@ -3,6 +3,7 @@ package demux
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // H.264 NAL unit type constants as defined in ITU-T H.264 Table 7-1.
@@ -50,6 +51,35 @@ type Timecode struct {
 // String formats the timecode as HH:MM:SS:FF.
 func (tc Timecode) String() string {
 	return fmt.Sprintf("%02d:%02d:%02d:%02d", tc.Hours, tc.Minutes, tc.Seconds, tc.Frames)
+}
+
+// WallUS reconstructs the timecode's instant as microseconds since the Unix epoch
+// (UTC), treating the timecode as UTC time-of-day. SMPTE 12M carries no date, so
+// the date is taken from ref (the observing wall clock): the time-of-day is placed
+// on ref's UTC day, then shifted ±24h if that lands more than 12h away from ref (a
+// timecode seen just before/after UTC midnight belongs to the adjacent day). fps
+// converts the sub-second Frames field; when fps <= 0 the Frames component is
+// dropped (whole-second precision). Returns 0 for a timecode that cannot be a valid
+// time-of-day (out-of-range fields), signalling "no usable wall clock" to callers.
+func (tc Timecode) WallUS(fps float64, ref time.Time) int64 {
+	if tc.Hours < 0 || tc.Hours > 23 || tc.Minutes < 0 || tc.Minutes > 59 || tc.Seconds < 0 || tc.Seconds > 59 {
+		return 0
+	}
+	ref = ref.UTC()
+	midnight := time.Date(ref.Year(), ref.Month(), ref.Day(), 0, 0, 0, 0, time.UTC)
+	todUS := int64(tc.Hours)*3_600_000_000 + int64(tc.Minutes)*60_000_000 + int64(tc.Seconds)*1_000_000
+	if fps > 0 && tc.Frames > 0 {
+		todUS += int64(float64(tc.Frames) / fps * 1_000_000)
+	}
+	captureUS := midnight.UnixMicro() + todUS
+	refUS := ref.UnixMicro()
+	const dayUS = int64(24 * 3600 * 1_000_000)
+	if captureUS-refUS > dayUS/2 {
+		captureUS -= dayUS
+	} else if refUS-captureUS > dayUS/2 {
+		captureUS += dayUS
+	}
+	return captureUS
 }
 
 var errSPSTooShort = errors.New("SPS data too short")

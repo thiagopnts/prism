@@ -195,9 +195,19 @@ type ServerConfig struct {
 
 	// ExternalUpstreamResolver resolves an `external=` query key (an extra feed
 	// to merge into the stream a viewer requests) to the prism host it must be
-	// pulled from. Returns ok=false for an unknown key, which fails that viewer's
-	// connection cleanly. When nil, any `external=` request is rejected.
+	// pulled from over MoQ. Returns ok=false for an unknown key, which fails that
+	// viewer's connection cleanly. This is the MoQ merge path; it is consulted only
+	// when VirtualExternalResolver is nil or declines the key. When both are nil,
+	// any `external=` request is rejected.
 	ExternalUpstreamResolver func(externalKey string) (UpstreamConfig, bool)
+
+	// VirtualExternalResolver resolves an `external=` query key to a
+	// caller-assembled virtual track (e.g. captions built from an HTTP feed)
+	// instead of a MoQ upstream. When set, it is consulted first for every
+	// `external=` key; a returned source is merged into the anchor's catalog and
+	// its frames are paced against the anchor timeline (see VirtualExternalSource).
+	// Returns ok=false to fall back to ExternalUpstreamResolver (the MoQ path).
+	VirtualExternalResolver func(externalKey string) (VirtualExternalSource, bool)
 }
 
 // streamResources bundles the relay and stats provider for a single live
@@ -443,6 +453,15 @@ func (s *Server) resolveMergeRelay(anchorKey string, externalKeys []string) (*Re
 
 	externals := make([]mergeExternal, 0, len(sorted))
 	for _, k := range sorted {
+		// Prefer the virtual (caller-assembled) path: a resolved source is merged
+		// with no upstream pull. Fall back to the MoQ path only when no virtual
+		// resolver is configured or it declines the key.
+		if s.config.VirtualExternalResolver != nil {
+			if src, ok := s.config.VirtualExternalResolver(k); ok {
+				externals = append(externals, mergeExternal{key: k, virtual: src})
+				continue
+			}
+		}
 		er, err := s.resolveExternalRelayLocked(k)
 		if err != nil {
 			return nil, err

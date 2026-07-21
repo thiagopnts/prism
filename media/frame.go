@@ -25,6 +25,14 @@ type VideoFrame struct {
 	Codec      string // "h264" or "h265"
 	GroupID    uint32
 	WireData   []byte // pre-serialized AVC1 (length-prefixed) NALUs for distribution
+
+	// CaptureWallUS is the frame's real capture time in microseconds since the Unix
+	// epoch (UTC), reconstructed from an embedded SMPTE 12M wall-clock timecode. It
+	// is 0 when the stream carries no usable timecode. Unlike PTS (an arbitrary
+	// media-clock value), this ties the media timeline to real time, letting
+	// consumers align wall-clock-timestamped side data (e.g. externally sourced
+	// captions) to the anchor without conflating the capture-to-ingest latency.
+	CaptureWallUS int64
 }
 
 // AudioFrame represents a single AAC audio frame (ADTS-wrapped) belonging
