@@ -276,3 +276,34 @@ func TestBuildMoQCatalogControlTrack(t *testing.T) {
 		t.Fatalf("control track codec = %q, want %q", controlTrack.SelectionParams.Codec, "application/json")
 	}
 }
+
+func TestBuildMoQCatalogAudioLanguage(t *testing.T) {
+	t.Parallel()
+	relay := NewRelay()
+	// Track 0 has a language, track 1 does not, track 2 does — index still
+	// progresses regardless of label presence.
+	relay.BroadcastAudio(&media.AudioFrame{TrackIndex: 0, SampleRate: 48000, Channels: 2, Language: "eng"})
+	relay.BroadcastAudio(&media.AudioFrame{TrackIndex: 1, SampleRate: 48000, Channels: 2})
+	relay.BroadcastAudio(&media.AudioFrame{TrackIndex: 2, SampleRate: 48000, Channels: 2, Language: "es"})
+
+	data, err := buildMoQCatalog("langstream", relay, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var cat moqCatalog
+	if err := json.Unmarshal(data, &cat); err != nil {
+		t.Fatal(err)
+	}
+
+	// video + audio0-eng + audio1 + audio2-es + captions + stats = 6 tracks
+	if len(cat.Tracks) != 6 {
+		t.Fatalf("track count = %d, want 6", len(cat.Tracks))
+	}
+	wantNames := []string{"audio0-eng", "audio1", "audio2-es"}
+	for i, want := range wantNames {
+		if cat.Tracks[i+1].Name != want {
+			t.Fatalf("tracks[%d].name = %q, want %q", i+1, cat.Tracks[i+1].Name, want)
+		}
+	}
+}

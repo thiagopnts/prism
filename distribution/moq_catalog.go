@@ -75,7 +75,7 @@ func buildMoQCatalog(streamKey string, relay *Relay, controlEnabled bool) ([]byt
 	// A feed with no audio advertises no audio track.
 	for _, t := range relay.ObservedAudioTracks() {
 		catalog.Tracks = append(catalog.Tracks, moqCatalogTrack{
-			Name: fmt.Sprintf("audio%d", t.Index),
+			Name: audioTrackName(t.Index, t.Info.Language),
 			SelectionParams: moqSelectionParams{
 				Codec:         t.Info.Codec,
 				SampleRate:    t.Info.SampleRate,

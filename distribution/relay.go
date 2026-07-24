@@ -39,6 +39,9 @@ type AudioInfo struct {
 	Codec      string
 	SampleRate int
 	Channels   int
+	// Language is the validated ISO 639 language label for the track (e.g.
+	// "eng"), or "" when the source declares none.
+	Language string
 }
 
 // audioCacheSize is the number of recent audio frames cached per track
@@ -222,6 +225,7 @@ func (r *Relay) observeAudio(frame *media.AudioFrame) {
 			Codec:      audioCodecAAC,
 			SampleRate: frame.SampleRate,
 			Channels:   frame.Channels,
+			Language:   frame.Language,
 		}
 	}
 	r.audioMu.Unlock()

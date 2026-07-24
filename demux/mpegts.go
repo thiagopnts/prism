@@ -26,6 +26,9 @@ const (
 type AudioTrackInfo struct {
 	PID        uint16
 	TrackIndex int
+	// Language is the validated ISO 639 language label for the track (e.g.
+	// "eng"), or "" when the PMT declares none.
+	Language string
 }
 
 // StatsRecorder is the interface accepted by Demuxer for recording stream
@@ -228,12 +231,14 @@ func (d *Demuxer) Run(ctx context.Context) error {
 					}
 				case streamTypeAAC:
 					if _, exists := d.audioPIDs[es.ElementaryPID]; !exists {
+						lang := audioLanguageFromDescriptors(es.Descriptors)
 						d.audioPIDs[es.ElementaryPID] = audioIdx
 						d.audioTracks = append(d.audioTracks, AudioTrackInfo{
 							PID:        es.ElementaryPID,
 							TrackIndex: audioIdx,
+							Language:   lang,
 						})
-						d.log.Info("found audio PID", "pid", es.ElementaryPID, "trackIndex", audioIdx)
+						d.log.Info("found audio PID", "pid", es.ElementaryPID, "trackIndex", audioIdx, "lang", lang)
 						audioIdx++
 					}
 				case streamTypePrivateData:
@@ -700,6 +705,11 @@ func (d *Demuxer) handleAudio(ctx context.Context, pes *mpegts.PESData, trackInd
 		}
 	}
 
+	lang := ""
+	if trackIndex >= 0 && trackIndex < len(d.audioTracks) {
+		lang = d.audioTracks[trackIndex].Language
+	}
+
 	aacFrames, err := ParseADTS(pes.Data)
 	if err != nil {
 		d.log.Warn("failed to parse ADTS", "error", err)
@@ -718,6 +728,7 @@ func (d *Demuxer) handleAudio(ctx context.Context, pes *mpegts.PESData, trackInd
 			SampleRate: aac.SampleRate,
 			Channels:   aac.Channels,
 			TrackIndex: trackIndex,
+			Language:   lang,
 		}
 
 		if d.stats != nil {

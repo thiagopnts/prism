@@ -385,6 +385,25 @@ func TestRelayObservedAudioTracks(t *testing.T) {
 	}
 }
 
+func TestRelayObservedAudioLanguage(t *testing.T) {
+	t.Parallel()
+
+	r := NewRelay()
+	r.BroadcastAudio(&media.AudioFrame{TrackIndex: 0, SampleRate: 48000, Channels: 2, Language: "eng"})
+	r.BroadcastAudio(&media.AudioFrame{TrackIndex: 1, SampleRate: 48000, Channels: 2}) // no language
+
+	got := r.ObservedAudioTracks()
+	if len(got) != 2 {
+		t.Fatalf("ObservedAudioTracks: got %d, want 2", len(got))
+	}
+	if got[0].Info.Language != "eng" {
+		t.Fatalf("track0 language = %q, want eng", got[0].Info.Language)
+	}
+	if got[1].Info.Language != "" {
+		t.Fatalf("track1 language = %q, want empty", got[1].Info.Language)
+	}
+}
+
 func TestRelayInitWindowDropsThenForwards(t *testing.T) {
 	t.Parallel()
 

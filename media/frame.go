@@ -44,4 +44,8 @@ type AudioFrame struct {
 	SampleRate int
 	Channels   int
 	TrackIndex int
+	// Language is the validated ISO 639 language label for this track (e.g.
+	// "eng"), or "" when the source stream declares none. Stamped by the demuxer
+	// from the PMT ISO 639 language descriptor.
+	Language string
 }

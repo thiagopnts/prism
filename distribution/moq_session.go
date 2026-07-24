@@ -8,8 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -357,12 +355,11 @@ func (m *MoQSession) handleSubscribe(ctx context.Context, sub moq.Subscribe) {
 		m.handleControlSubscribe(ctx, sub, alias)
 
 	default:
-		// Check for audio tracks: "audio0", "audio1", etc.
-		if suffix, ok := strings.CutPrefix(trackName, "audio"); ok {
-			if idx, err := strconv.Atoi(suffix); err == nil && idx >= 0 {
-				m.handleMediaSubscribe(ctx, sub, alias, trackName, "audio", idx)
-				return
-			}
+		// Audio tracks: "audio0", "audio1", … optionally with a language suffix
+		// such as "audio0-eng". Route by the parsed integer index.
+		if idx, ok := parseAudioTrackIndex(trackName); ok {
+			m.handleMediaSubscribe(ctx, sub, alias, trackName, "audio", idx)
+			return
 		}
 		m.sendSubscribeError(sub.RequestID, 404, moq.ErrUnknownTrack.Error())
 	}
@@ -431,8 +428,16 @@ func (m *MoQSession) handleMediaSubscribe(ctx context.Context, sub moq.Subscribe
 		go m.writeCaptionLoop(subCtx, trackSub)
 	}
 
+	// Audio subscriptions are keyed by their canonical index-only name (e.g.
+	// "audio0") regardless of any language suffix the client subscribed with, so
+	// SendAudio — which knows only the frame's track index — always matches.
+	storeKey := trackName
+	if mediaType == "audio" {
+		storeKey = audioTrackName(audioIdx, "")
+	}
+
 	m.mu.Lock()
-	m.subscriptions[trackName] = trackSub
+	m.subscriptions[storeKey] = trackSub
 	m.mu.Unlock()
 
 	m.sendSubscribeOK(sub.RequestID, alias, moq.GroupOrderAscending, false, 0, 0)
@@ -456,12 +461,8 @@ func isRelayableTrack(trackName string) bool {
 	case "video", "captions", "stats":
 		return true
 	}
-	if suffix, ok := strings.CutPrefix(trackName, "audio"); ok {
-		if idx, err := strconv.Atoi(suffix); err == nil && idx >= 0 {
-			return true
-		}
-	}
-	return false
+	_, ok := parseAudioTrackIndex(trackName)
+	return ok
 }
 
 // handleRawSubscribe handles a SUBSCRIBE for a relayed stream by forwarding the

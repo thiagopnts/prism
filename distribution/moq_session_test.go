@@ -603,6 +603,85 @@ func TestMoQSessionSendAudioWithSub(t *testing.T) {
 	}
 }
 
+func TestMoQSessionHandleSubscribeAudioLanguage(t *testing.T) {
+	t.Parallel()
+	relay := NewRelay()
+	responseBuf := &bytes.Buffer{}
+	controlStream := &mockControlStream{
+		Reader: &bytes.Buffer{},
+		Writer: responseBuf,
+	}
+
+	session := &MoQSession{
+		id:            "test-session",
+		streamKey:     "live",
+		control:       controlStream,
+		log:           slog.With("session", "test-session"),
+		relay:         relay,
+		subscriptions: make(map[string]*moqTrackSub),
+	}
+
+	sub := moq.Subscribe{
+		RequestID:  2,
+		Namespace:  []string{"prism", "live"},
+		TrackName:  "audio0-eng",
+		FilterType: moq.FilterLatestObject,
+	}
+	session.handleSubscribe(context.Background(), sub)
+
+	msgType, _, err := moq.ReadControlMsg(responseBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgType != moq.MsgSubscribeOK {
+		t.Fatalf("response type = %#x, want SUBSCRIBE_OK", msgType)
+	}
+
+	// Stored under the canonical index-only key so SendAudio (which knows only
+	// the track index) can find it.
+	session.mu.RLock()
+	audioSub := session.subscriptions["audio0"]
+	session.mu.RUnlock()
+	if audioSub == nil {
+		t.Fatal("audio subscription not stored under canonical key audio0")
+	}
+	if audioSub.audioTrackIndex != 0 {
+		t.Fatalf("audioTrackIndex = %d, want 0", audioSub.audioTrackIndex)
+	}
+	if audioSub.audioCh == nil {
+		t.Fatal("audio channel not created")
+	}
+}
+
+func TestMoQSessionSendAudioCanonicalKey(t *testing.T) {
+	t.Parallel()
+	session := &MoQSession{
+		id:            "test-session",
+		streamKey:     "live",
+		subscriptions: make(map[string]*moqTrackSub),
+	}
+
+	// Subscriptions are stored under the canonical index-only key ("audio0"),
+	// even when the client subscribed with a language suffix. A language-carrying
+	// frame for that index must still be delivered.
+	session.subscriptions["audio0"] = &moqTrackSub{
+		trackName:       "audio0-eng",
+		audioCh:         make(chan *media.AudioFrame, 10),
+		audioTrackIndex: 0,
+	}
+
+	frame := &media.AudioFrame{
+		PTS:        1000000,
+		Data:       []byte{0xFF, 0xF1, 0x00, 0x00, 0x00, 0x00, 0x00},
+		TrackIndex: 0,
+		Language:   "eng",
+	}
+	session.SendAudio(frame)
+	if session.audioSent.Load() != 1 {
+		t.Fatalf("audioSent = %d, want 1", session.audioSent.Load())
+	}
+}
+
 func TestMoQSessionStats(t *testing.T) {
 	t.Parallel()
 	session := &MoQSession{

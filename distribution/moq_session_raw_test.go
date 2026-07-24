@@ -129,13 +129,13 @@ func TestRawStreamMuxOpenErrorPropagates(t *testing.T) {
 }
 
 func TestIsRelayableTrack(t *testing.T) {
-	relayable := []string{"video", "captions", "stats", "audio0", "audio3", "audio12"}
+	relayable := []string{"video", "captions", "stats", "audio0", "audio3", "audio12", "audio0-eng", "audio1-es"}
 	for _, n := range relayable {
 		if !isRelayableTrack(n) {
 			t.Errorf("isRelayableTrack(%q) = false, want true", n)
 		}
 	}
-	notRelayable := []string{"catalog", "control", "audio", "audiox", "bogus", ""}
+	notRelayable := []string{"catalog", "control", "audio", "audiox", "audio0eng", "bogus", ""}
 	for _, n := range notRelayable {
 		if isRelayableTrack(n) {
 			t.Errorf("isRelayableTrack(%q) = true, want false", n)
