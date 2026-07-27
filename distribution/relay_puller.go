@@ -50,6 +50,15 @@ type RelayPuller struct {
 	live *liveConn
 
 	reconnects atomic.Int64
+
+	// reResolve, when non-nil, is invoked by run after a failed connection
+	// attempt to re-resolve the upstream (host failover / cert rotation / feed
+	// teardown). onGone, when non-nil, is called when reResolve declines (the
+	// feed is gone) so the owner can evict the stream. Both are set once by
+	// Server.resolvePrimaryRelay before the puller is exposed; nil for
+	// RegisterRelayedUpstream and external-merge pullers (they keep retrying).
+	reResolve func(ctx context.Context) (UpstreamConfig, bool)
+	onGone    func()
 }
 
 // UpstreamConfig identifies the upstream prism stream a RelayPuller pulls from.
@@ -262,6 +271,9 @@ func (p *RelayPuller) run(ctx context.Context) {
 			p.reconnects.Add(1)
 			p.log.Warn("relay pull disconnected; reconnecting",
 				"error", err, "backoff", backoff, "reconnects", p.reconnects.Load())
+			if p.reResolve != nil && !p.applyReResolve(ctx) {
+				return // feed gone: onGone evicted the stream, stop pulling
+			}
 		}
 		select {
 		case <-time.After(backoff):
@@ -277,6 +289,26 @@ func (p *RelayPuller) run(ctx context.Context) {
 			backoff = time.Second
 		}
 	}
+}
+
+// applyReResolve re-invokes reResolve after a failed connection attempt. When it
+// declines (the feed is gone) applyReResolve calls onGone (evicting the stream)
+// and returns false so run stops. Otherwise it applies the resolved upstream via
+// SetUpstream — a changed addr/cert set forces the next runOnce to dial the new
+// host, an unchanged one is a no-op — and returns true so run keeps going
+// (backing off as usual for the same host, retrying against a new one). Called
+// only when reResolve is non-nil.
+func (p *RelayPuller) applyReResolve(ctx context.Context) bool {
+	cfg, ok := p.reResolve(ctx)
+	if !ok {
+		p.log.Info("relay pull: upstream feed gone; evicting")
+		if p.onGone != nil {
+			p.onGone()
+		}
+		return false
+	}
+	p.SetUpstream(cfg.Addr, cfg.CertHashes)
+	return true
 }
 
 // runOnce handles a single connection lifetime: dial, handshake, subscribe the

@@ -201,6 +201,17 @@ type ServerConfig struct {
 	// any `external=` request is rejected.
 	ExternalUpstreamResolver func(externalKey string) (UpstreamConfig, bool)
 
+	// PrimaryUpstreamResolver resolves the primary stream key a viewer requests
+	// (via ?stream= or the PATH parameter) to the prism host it must be pulled
+	// from over MoQ, on a GetRelay miss. Returns ok=false for an unknown/gone
+	// feed, which closes the viewer's connection cleanly with stream-not-found
+	// (the pre-resolver behavior on a miss). Unlike ExternalUpstreamResolver (the
+	// external= merge path), this drives the primary stream a viewer watches and
+	// is re-invoked by the relay puller after a connection failure to follow host
+	// failover (SetUpstream + retry) or evict a feed that has gone away. It may do
+	// I/O (e.g. a registry lookup); it is never called while Server.mu is held.
+	PrimaryUpstreamResolver func(ctx context.Context, streamKey string) (UpstreamConfig, bool)
+
 	// VirtualExternalResolver resolves an `external=` query key to a
 	// caller-assembled virtual track (e.g. captions built from an HTTP feed)
 	// instead of a MoQ upstream. When set, it is consulted first for every
@@ -413,6 +424,65 @@ func (s *Server) resolveExternalRelayLocked(externalKey string) (*Relay, error) 
 	r.attachPuller(puller, upCtx)
 	s.externalRelays[externalKey] = &streamResources{relay: r, puller: puller, upstreamCancel: upCancel}
 	return r, nil
+}
+
+// resolvePrimaryRelay builds (or returns the already-registered) relay for a
+// primary stream key on a GetRelay miss, resolving the upstream via
+// PrimaryUpstreamResolver. Like RegisterRelayedUpstream it is pure bookkeeping:
+// it creates a cold relay + RelayPuller and records both, opening no connection
+// until the first viewer's EnsureUpstream. It returns ok=false when no resolver
+// is configured or the resolver declines (unknown/gone feed), so the caller
+// closes the viewer with stream-not-found.
+//
+// The resolver call may do I/O, so — unlike resolveExternalRelayLocked — it runs
+// WITHOUT Server.mu held. A double-check under the lock makes a concurrent
+// resolve of the same key return the single winner (the loser discards its
+// unused cfg; nothing was dialed).
+func (s *Server) resolvePrimaryRelay(ctx context.Context, streamKey string) (*Relay, bool) {
+	if s.config.PrimaryUpstreamResolver == nil {
+		return nil, false
+	}
+
+	s.mu.RLock()
+	if sr, ok := s.streams[streamKey]; ok {
+		r := sr.relay
+		s.mu.RUnlock()
+		return r, true
+	}
+	s.mu.RUnlock()
+
+	cfg, ok := s.config.PrimaryUpstreamResolver(ctx, streamKey)
+	if !ok {
+		return nil, false
+	}
+	if cfg.StreamKey == "" {
+		cfg.StreamKey = streamKey
+	}
+
+	s.mu.Lock()
+	if sr, ok := s.streams[streamKey]; ok { // lost the resolve race; use the winner
+		r := sr.relay
+		s.mu.Unlock()
+		return r, true
+	}
+	r := NewRelay()
+	upCtx, upCancel := context.WithCancel(context.Background())
+	puller := NewRelayPuller(r, cfg)
+	// Re-resolve on connection failure to follow SRT-host failover / cert
+	// rotation, and evict the stream when the feed is gone. Same-package field
+	// assignment — see RelayPuller.run / applyReResolve.
+	puller.reResolve = func(ctx context.Context) (UpstreamConfig, bool) {
+		return s.config.PrimaryUpstreamResolver(ctx, streamKey)
+	}
+	puller.onGone = func() { s.UnregisterStream(streamKey) }
+	r.attachPuller(puller, upCtx)
+	s.streams[streamKey] = &streamResources{relay: r, puller: puller, upstreamCancel: upCancel}
+	s.mu.Unlock()
+
+	if s.config.OnStreamRegistered != nil {
+		s.config.OnStreamRegistered(streamKey, r)
+	}
+	return r, true
 }
 
 // resolveMergeRelay returns the synthetic merge relay for the given anchor stream
@@ -799,9 +869,13 @@ func (s *Server) setupMoQ(r *http.Request, session *webtransport.Session, contro
 
 	relay := s.GetRelay(streamKey)
 	if relay == nil && streamKey != "" {
-		slog.Warn("moq stream not found", "stream", streamKey)
-		session.CloseWithError(wtErrStreamNotFound, "stream not found")
-		return "", nil, nil, moq.ErrUnknownTrack
+		if resolved, ok := s.resolvePrimaryRelay(r.Context(), streamKey); ok {
+			relay = resolved
+		} else {
+			slog.Warn("moq stream not found", "stream", streamKey)
+			session.CloseWithError(wtErrStreamNotFound, "stream not found")
+			return "", nil, nil, moq.ErrUnknownTrack
+		}
 	}
 
 	moqSession := NewMoQSession(MoQSessionConfig{
@@ -829,9 +903,13 @@ func (s *Server) setupMoQ(r *http.Request, session *webtransport.Session, contro
 		moqSession.streamKey = streamKey
 		relay = s.GetRelay(streamKey)
 		if relay == nil {
-			slog.Warn("moq stream not found (from PATH)", "stream", streamKey)
-			session.CloseWithError(wtErrStreamNotFound, "stream not found")
-			return "", nil, nil, moq.ErrUnknownTrack
+			if resolved, ok := s.resolvePrimaryRelay(r.Context(), streamKey); ok {
+				relay = resolved
+			} else {
+				slog.Warn("moq stream not found (from PATH)", "stream", streamKey)
+				session.CloseWithError(wtErrStreamNotFound, "stream not found")
+				return "", nil, nil, moq.ErrUnknownTrack
+			}
 		}
 		moqSession.relay = relay
 	}
